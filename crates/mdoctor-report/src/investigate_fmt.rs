@@ -65,15 +65,35 @@ pub fn render_investigate_terminal(results: &[InvestigationResult], target_sympt
                 .map(|m| format!(" ({})", m.dimmed()))
                 .unwrap_or_default();
 
-            out.push_str(&format!("│   {} {:<15} {}{}\n", type_str, node.subsystem.bold(), node.description, metric_str));
+            // Pad the plain subsystem name before colouring it: `{:<15}` counts the
+            // ANSI escape bytes, so padding a coloured string misaligns the column.
+            let subsystem = format!("{:<15}", node.subsystem);
+            out.push_str(&format!(
+                "│   {} {} {}{}\n",
+                type_str,
+                subsystem.bold(),
+                node.description,
+                metric_str
+            ));
             if n_idx + 1 < res.causal_chain.nodes.len() {
                 out.push_str("│        ⬇\n");
+            }
+        }
+
+        // What the diagnosis is actually built on.
+        if !res.evidence_basis.is_empty() {
+            out.push_str("│ Evidence Measured:\n");
+            for item in &res.evidence_basis {
+                out.push_str(&format!("│   • {}\n", item));
             }
         }
 
         // Culprit Modules
         if !res.culprit_modules.is_empty() {
             out.push_str(&format!("│\n│ Implicated Modules: {}\n", res.culprit_modules.join(", ").cyan().bold()));
+        }
+        if res.culprit_modules.is_empty() && !res.evidence_basis.is_empty() {
+            out.push_str("│\n");
         }
 
         // Culprit Queries
@@ -128,6 +148,7 @@ mod tests {
             confidence: Confidence::High,
             impact_score: 95,
             summary: "Test summary description".to_string(),
+            evidence_basis: vec!["Measured signal A".to_string(), "Measured signal B".to_string()],
             causal_chain: chain,
             culprit_modules: vec!["Vendor_Test".to_string()],
             culprit_queries: vec!["SELECT * FROM test".to_string()],
@@ -139,5 +160,7 @@ mod tests {
         assert!(output.contains("Test Bottleneck"));
         assert!(output.contains("Vendor_Test"));
         assert!(output.contains("[Culprit]"));
+        assert!(output.contains("Evidence Measured"));
+        assert!(output.contains("Measured signal A"));
     }
 }

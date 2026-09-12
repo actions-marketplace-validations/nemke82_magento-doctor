@@ -114,21 +114,26 @@ fn test_fixture_scan_end_to_end() {
     // 10. Test Root Cause Investigate Engine end-to-end
     let mut runtime_inst = installation.clone();
 
-    // Inject runtime telemetry: PHP worker pressure + slow query digest
+    // Inject runtime telemetry: PHP worker pressure + slow query digest. The source is
+    // FpmStatus because only a real scoreboard reading can support a saturation claim.
     runtime_inst.runtime.php_workers = mdoctor_core::PhpWorkerMetrics {
         is_detected: true,
-        pool_name: "www".to_string(),
-        process_manager: "dynamic".to_string(),
-        active_workers: 45,
-        idle_workers: 5,
-        total_workers: 50,
-        max_children: 50,
-        listen_queue: 6,
-        max_children_reached: 1,
-        saturation_pct: 90.0,
-        estimated_worker_memory_mb: 150.0,
-        total_pool_memory_mb: 7500.0,
-        oom_risk: false,
+        source: mdoctor_core::WorkerMetricSource::FpmStatus,
+        origin: Some("http://web-1.internal:80/status?json".to_string()),
+        pool_name: Some("www".to_string()),
+        process_manager: Some("dynamic".to_string()),
+        active_workers: Some(45),
+        idle_workers: Some(5),
+        total_workers: Some(50),
+        max_children: Some(50),
+        listen_queue: Some(6),
+        max_children_reached: Some(1),
+        saturation_pct: Some(90.0),
+        worker_memory_mb: Some(150.0),
+        worker_memory_measured: true,
+        total_pool_memory_mb: Some(7500.0),
+        host_total_memory_mb: Some(16384.0),
+        ..Default::default()
     };
 
     let slow_digest = mdoctor_core::QueryDigest {
@@ -163,5 +168,50 @@ fn test_fixture_scan_end_to_end() {
     let json_rep = mdoctor_report::render_investigate_json(&investigations).expect("Investigation JSON output");
     assert!(json_rep.contains("impact_score"));
     assert!(json_rep.contains("causal_chain"));
+    assert!(json_rep.contains("evidence_basis"));
+
+    // 12. The same installation with only /proc-derived worker data must not produce a
+    // saturation diagnosis: /proc counts a worker blocked on MySQL as idle.
+    let mut proc_only = installation.clone();
+    proc_only.runtime.php_workers = mdoctor_core::PhpWorkerMetrics {
+        is_detected: true,
+        source: mdoctor_core::WorkerMetricSource::ProcScan,
+        pool_name: Some("www".to_string()),
+        active_workers: Some(49),
+        max_children: Some(50),
+        saturation_pct: Some(98.0),
+        ..Default::default()
+    };
+    let proc_findings = mdoctor_rules::CrossAnalysisEngine::analyze(&proc_only);
+    assert!(
+        proc_findings.iter().all(|f| f.rule_id != "MD-FPM-001"),
+        "an approximate /proc saturation figure must not raise a saturation finding"
+    );
+
+    // 13. A bare uncacheable-block scan is offline-safe and makes no Varnish claim.
+    assert!(
+        !installation.runtime.fpc.is_varnish_reachable,
+        "no probe ran, so no Varnish claim may be made"
+    );
+    assert!(
+        !installation.runtime.fpc.is_varnish_configured,
+        "the fixture env.php declares no http_cache_hosts"
+    );
+
+    // 14. Endpoint overrides round-trip through an mdoctor.toml file.
+    let targets = mdoctor_core::RemoteTargets::from_toml(
+        r#"
+[endpoints]
+varnish = { host = "varnish-1.internal", port = 6081 }
+redis_session = { host = "session-1.internal", port = 6379 }
+fpm_status_url = { host = "web-1.internal", port = 80, path = "/status?json" }
+opensearch = { host = "search-1.internal", port = 9200 }
+"#,
+    )
+    .expect("endpoint config parses");
+    assert_eq!(targets.varnish.as_ref().unwrap().host, "varnish-1.internal");
+    assert_eq!(targets.redis_session.as_ref().unwrap().port, 6379);
+    assert_eq!(targets.fpm_status_url.as_ref().unwrap().path, "/status?json");
+    assert_eq!(targets.opensearch.as_ref().unwrap().host, "search-1.internal");
 }
 

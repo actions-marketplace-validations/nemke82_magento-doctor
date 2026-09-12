@@ -1,0 +1,77 @@
+# Magento Doctor endpoint configuration
+#
+# Copy to `mdoctor.toml` in your Magento root (or the directory you run mdoctor from)
+# and it is picked up automatically. Command-line flags override anything set here.
+#
+# You only need this when mdoctor cannot reach a service the way app/etc/env.php
+# describes it — typically a clustered store, or a run from a jump host where
+# PHP-FPM, Varnish, Nginx, Redis and OpenSearch each live on their own node.
+# On a single-server install, omit the file entirely: mdoctor discovers everything
+# from env.php and the local host.
+#
+# Every endpoint is optional. An omitted service falls back to local discovery.
+# mdoctor speaks plain HTTP only: tunnel TLS endpoints over SSH rather than
+# pointing it at https://.
+
+[endpoints]
+
+# --- Web tier -----------------------------------------------------------------
+
+# Varnish, probed over HTTP and identified from its own response headers
+# (Via / X-Varnish / Server). Default port 6081.
+# varnish = { host = "varnish-1.internal", port = 6081 }
+
+# The storefront itself, as an alternative to a direct Varnish address: its
+# response headers still reveal whether a proxy tier fronts the store. Useful when
+# only the public entry point is reachable from where mdoctor runs.
+# storefront_url = { host = "shop.internal", port = 80, path = "/" }
+
+# PHP-FPM status page. This is the only source with a true active-worker count and
+# listen queue depth, so worker-saturation findings (MD-FPM-001) require it.
+# Enable it in the pool config first:
+#
+#   pm.status_path = /status
+#
+# and expose it in the web server, e.g. for nginx:
+#
+#   location = /status {
+#       access_log off;
+#       allow 10.0.0.0/8;   # restrict to your management network
+#       deny all;
+#       fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+#       include fastcgi_params;
+#       fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+#   }
+#
+# fpm_status_url = { host = "web-1.internal", port = 80, path = "/status?json" }
+
+# PHP-FPM pool config, when it is not in a standard location. Read for
+# pm.max_children, which the status page does not expose but pool sizing needs.
+# fpm_conf = "/etc/php/8.3/fpm/pool.d/magento.conf"
+
+# Nginx stub_status, for correlating web-tier connection pressure with PHP-FPM.
+# Requires `stub_status;` in a restricted location block.
+# nginx_status_url = { host = "web-1.internal", port = 80, path = "/nginx_status" }
+
+# --- Redis / Valkey -----------------------------------------------------------
+
+# Default port 6379. Give sessions their own instance where you can: cache churn
+# on a shared instance can pressure session keys out of memory.
+# redis_cache        = { host = "cache-1.internal", port = 6379 }
+# redis_session      = { host = "session-1.internal", port = 6379 }
+# redis_page_cache   = { host = "fpc-1.internal", port = 6379 }
+
+# Redis password. Prefer the MDOCTOR_REDIS_PASSWORD environment variable, or the
+# --redis-password flag, over committing a secret to this file. mdoctor never
+# writes a password into a report, snapshot or baseline.
+# redis_password = "..."
+
+# --- Search -------------------------------------------------------------------
+
+# OpenSearch or Elasticsearch coordinating node. Default port 9200.
+# opensearch = { host = "search-1.internal", port = 9200 }
+
+# Basic-auth credentials as "user:password". Prefer the MDOCTOR_OPENSEARCH_AUTH
+# environment variable. Without credentials a secured cluster answers 401, and
+# mdoctor reports that as a failed probe rather than as a degraded cluster.
+# opensearch_auth = "admin:..."

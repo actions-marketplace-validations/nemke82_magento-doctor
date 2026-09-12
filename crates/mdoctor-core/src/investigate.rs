@@ -83,8 +83,11 @@ pub struct InvestigationResult {
     pub confidence: Confidence,
     /// Impact severity score (0 to 100).
     pub impact_score: u32,
-    /// Executive summary.
+    /// Executive summary. Derived from the signals that actually fired, never fixed prose.
     pub summary: String,
+    /// Exactly what was measured to support this diagnosis, so a reader can tell a
+    /// correlated multi-signal finding from a single weak one.
+    pub evidence_basis: Vec<String>,
     /// Step-by-step causal chain explaining the mechanics.
     pub causal_chain: CausalChain,
     /// Responsible or implicated Magento modules.

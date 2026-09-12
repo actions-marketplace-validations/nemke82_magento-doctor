@@ -1,7 +1,7 @@
 //! Full installation collector building the normalized MagentoInstallation model.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use mdoctor_core::{DatabaseSchema, Environment, MagentoInstallation};
 
 use crate::composer_parser::parse_composer_info;
@@ -126,17 +126,7 @@ pub fn collect_installation(root: &Path) -> MagentoInstallation {
         // Layout XML: check view/frontend/layout and view/base/layout for uncacheable blocks
         for layout_rel in &["view/frontend/layout", "view/base/layout"] {
             let layout_dir = module.path.join(layout_rel);
-            if layout_dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(&layout_dir) {
-                    for entry in entries.filter_map(|e| e.ok()) {
-                        let path = entry.path();
-                        if path.extension().is_some_and(|ext| ext == "xml") {
-                            let uncacheable = parse_layout_xml(&path, &module.name);
-                            all_uncacheable_blocks.extend(uncacheable);
-                        }
-                    }
-                }
-            }
+            all_uncacheable_blocks.extend(collect_uncacheable_in_dir(&layout_dir, &module.name));
         }
     }
 
@@ -147,6 +137,11 @@ pub fn collect_installation(root: &Path) -> MagentoInstallation {
     installation.cron_jobs = all_crons;
     installation.indexers = all_indexers;
     installation.declared_schema = DatabaseSchema { tables: all_tables };
+
+    // Theme overrides are where cacheable="false" most often hides in production:
+    // app/design/frontend/<Vendor>/<theme>/<Module>/layout/*.xml overrides the module's
+    // own layout, so scanning modules alone misses it.
+    all_uncacheable_blocks.extend(collect_theme_layout_overrides(root));
     installation.runtime.fpc.uncacheable_blocks = all_uncacheable_blocks;
 
     // 6. Environment metadata
@@ -197,4 +192,67 @@ fn detect_git_branch(root: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Collects uncacheable blocks from every XML file under `dir`, recursively.
+fn collect_uncacheable_in_dir(dir: &Path, module_name: &str) -> Vec<mdoctor_core::UncacheableBlock> {
+    let mut blocks = Vec::new();
+    if !dir.is_dir() {
+        return blocks;
+    }
+
+    for entry in walkdir::WalkDir::new(dir)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "xml") {
+            blocks.extend(parse_layout_xml(path, module_name));
+        }
+    }
+
+    blocks
+}
+
+/// Scans theme layout overrides under app/design/frontend/<Vendor>/<theme>/<Module>/layout.
+///
+/// The owning module is taken from the directory name, so a finding still points at the
+/// extension responsible rather than at the theme.
+fn collect_theme_layout_overrides(root: &Path) -> Vec<mdoctor_core::UncacheableBlock> {
+    let mut blocks = Vec::new();
+    let design_root = root.join("app/design/frontend");
+    if !design_root.is_dir() {
+        return blocks;
+    }
+
+    let read_dirs = |p: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(p)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    for vendor_dir in read_dirs(&design_root) {
+        for theme_dir in read_dirs(&vendor_dir) {
+            for module_dir in read_dirs(&theme_dir) {
+                // A theme's own Magento_Theme/layout and <Module>/layout both live here.
+                let Some(module_name) = module_dir.file_name().map(|n| n.to_string_lossy().to_string())
+                else {
+                    continue;
+                };
+                if !module_name.contains('_') {
+                    continue;
+                }
+                blocks.extend(collect_uncacheable_in_dir(&module_dir.join("layout"), &module_name));
+            }
+        }
+    }
+
+    blocks
 }

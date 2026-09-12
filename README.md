@@ -164,6 +164,8 @@ cd /var/www/html/magento
 mdoctor scan
 ```
 
+This covers a single-server install. For a clustered store, or a run from a jump host, point mdoctor at each service explicitly — see [Clustered Stores & Jump-Host Runs](#clustered-stores--jump-host-runs).
+
 You can also specify an explicit directory via `--root` or the `MAGENTO_ROOT` environment variable:
 ```bash
 mdoctor --root /var/www/magento scan
@@ -279,6 +281,56 @@ mdoctor fpm
 # OpenSearch cluster health, shard unallocations, and catalog index presence
 mdoctor opensearch
 ```
+
+### Clustered Stores & Jump-Host Runs
+
+On a single-server install, mdoctor finds everything itself from `app/etc/env.php` and the local host. On a cluster — or when you run from a jump host — PHP-FPM, Varnish, Nginx, Redis and OpenSearch each live somewhere else, so tell mdoctor where to look:
+
+```bash
+mdoctor investigate \
+  --varnish       varnish-1.internal:6081 \
+  --fpm-status    http://web-1.internal/status \
+  --nginx-status  http://web-1.internal/nginx_status \
+  --redis-cache   cache-1.internal:6379 \
+  --redis-session session-1.internal:6379 \
+  --opensearch    search-1.internal:9200
+```
+
+Rather than repeating those flags, commit an `mdoctor.toml` to the Magento root (see [`mdoctor.toml.example`](mdoctor.toml.example)). It is picked up automatically, and individual flags still override it for a one-off run:
+
+```toml
+[endpoints]
+varnish          = { host = "varnish-1.internal", port = 6081 }
+fpm_status_url   = { host = "web-1.internal", port = 80, path = "/status?json" }
+nginx_status_url = { host = "web-1.internal", port = 80, path = "/nginx_status" }
+redis_cache      = { host = "cache-1.internal", port = 6379 }
+redis_session    = { host = "session-1.internal", port = 6379 }
+opensearch       = { host = "search-1.internal", port = 9200 }
+```
+
+```bash
+mdoctor fpm --config /etc/mdoctor/prod.toml
+```
+
+**Credentials** come from the environment so they stay out of shell history and out of the repo. mdoctor never writes them into a report, snapshot or baseline:
+
+```bash
+export MDOCTOR_REDIS_PASSWORD='...'
+export MDOCTOR_OPENSEARCH_AUTH='admin:...'
+mdoctor redis
+```
+
+Notes on what each endpoint buys you:
+
+| Flag | Why it matters |
+|---|---|
+| `--fpm-status` | The PHP-FPM status page is the **only** source of a true active-worker count and listen queue depth, so `MD-FPM-001` needs it. Set `pm.status_path` in the pool config and expose it to your management network. A `/proc` scan counts a worker blocked on MySQL as idle, so mdoctor deliberately will not raise a saturation finding from one. |
+| `--varnish` / `--storefront-url` | Varnish is identified from the `Via`, `X-Varnish` and `Server` response headers, never from an open port — port 80 on a Magento host is nginx or Apache. If only the public storefront is reachable, `--storefront-url` reads the same headers through it. |
+| `--redis-cache` / `--redis-session` | Probed separately so `evicted_keys`, a **server-wide** counter, is only attributed to sessions when they have their own instance. |
+| `--opensearch-auth` | Without credentials a secured cluster answers `401`, which mdoctor reports as a failed probe rather than as a degraded or empty cluster. |
+| `--nginx-status` | `stub_status` counters (active connections, dropped connections) for correlating web-tier pressure with PHP-FPM. |
+
+mdoctor speaks plain HTTP only; tunnel TLS endpoints over SSH rather than pointing it at `https://`. A malformed or unreachable endpoint is reported explicitly — it never silently falls back to probing localhost.
 
 ### Configuration Drift & Baseline Comparison
 
@@ -445,11 +497,19 @@ mdoctor snapshot analyze customer_audit.mdoctor
 | **Cron**        | `MD-CRON-*`| Schedule backlog, overlap storms, stuck running jobs |
 | **Indexers**    | `MD-IDX-*` | Realtime vs scheduled indexer modes, changelog backlog |
 | **Database**    | `MD-DB-*`  | Missing declared indexes, redundant left-prefix indexes, orphan tables, volatile bloat |
-| **SQL Forensics**| `MD-SQL-*` | High latency query digests, active transaction and metadata lock waits |
-| **Cache & Redis**| `MD-CACHE-*`, `MD-RDS-*`| Redis DB collisions, session eviction hazards, fragmentation, hit ratio |
-| **FPC & Varnish**| `MD-FPC-*` | Storefront layout punctures (`cacheable="false"`), reverse proxy health |
-| **PHP Workers** | `MD-FPM-*` | PHP-FPM worker saturation, listen queue spikes, host RAM OOM risk |
-| **Search Engine**| `MD-SRC-*` | OpenSearch/Elasticsearch cluster health degradation, missing catalog indices |
+| **SQL Forensics**| `MD-SQL-001` | High latency query digest (performance_schema, scoped to the store's schema) |
+| | `MD-SQL-002` | Confirmed transaction lock wait, with the blocking transaction named |
+| | `MD-SQL-003` | Long-running statement holding a connection (not a lock wait) |
+| **Cache & Redis**| `MD-CACHE-*` | Redis database collisions between sessions, cache and page cache |
+| | `MD-RDS-001` | Session store can evict live sessions (`allkeys-*` policy, or attributable evictions) |
+| | `MD-RDS-002` | Cache instance memory pressure or severe fragmentation |
+| | `MD-RDS-003` | Low cache hit ratio (cache thrashing) |
+| **FPC & Varnish**| `MD-FPC-001` | Storefront layout puncture (`cacheable="false"`), modules and theme overrides |
+| **PHP Workers** | `MD-FPM-001` | Worker pool saturation / listen queue buildup (requires the FPM status page) |
+| | `MD-FPM-002` | `pm.max_children` x worker footprint exceeds host RAM (OOM risk) |
+| **Search Engine**| `MD-SRC-001` | Cluster health degraded (single-node yellow excluded — see `MD-SRC-002`) |
+| | `MD-SRC-002` | Single-node cluster has no replica redundancy (informational) |
+| | `MD-SRC-003` | No catalog search index present, prefix-agnostic |
 | **Performance** | `MD-PERF-*`| N+1 repository loops, synchronous HTTP calls, loop logging |
 | **Security**    | `MD-SEC-*` | Developer mode in production, world-writable directories |
 

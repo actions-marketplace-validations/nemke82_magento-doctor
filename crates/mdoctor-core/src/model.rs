@@ -307,6 +307,47 @@ pub struct CronScheduleSummary {
     pub job_stats: HashMap<String, JobRuntimeStat>,
 }
 
+/// Result of attempting to measure something over the network or from the host.
+///
+/// Keeping "we could not look" distinct from "we looked and it was fine" is what
+/// stops an unreachable or access-denied service from being reported as healthy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProbeOutcome {
+    /// No attempt was made (offline mode, or no endpoint configured).
+    #[default]
+    NotAttempted,
+    /// An attempt was made and failed; `reason` is safe to show the operator.
+    Failed { reason: String },
+    /// The probe returned usable data.
+    Succeeded,
+}
+
+impl ProbeOutcome {
+    pub fn failed(reason: impl Into<String>) -> Self {
+        Self::Failed { reason: reason.into() }
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+
+    /// True when the probe never ran or could not complete, so its data is unknown
+    /// rather than negative.
+    pub fn is_inconclusive(&self) -> bool {
+        !self.is_success()
+    }
+}
+
+impl std::fmt::Display for ProbeOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAttempted => write!(f, "not attempted"),
+            Self::Failed { reason } => write!(f, "failed: {}", reason),
+            Self::Succeeded => write!(f, "ok"),
+        }
+    }
+}
+
 /// Query digest metric extracted from performance_schema or slow log.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueryDigest {
@@ -332,6 +373,12 @@ pub struct ActiveLockWait {
     pub blocking_query: Option<String>,
     pub wait_time_secs: u64,
     pub table_name: Option<String>,
+    /// True only when performance_schema named a genuine blocker/blocked pair.
+    /// A long-running query from the processlist heuristic is not a lock wait.
+    pub is_confirmed_lock_wait: bool,
+    /// processlist COMMAND, kept so replication and daemon threads stay identifiable.
+    pub command: Option<String>,
+    pub user: Option<String>,
 }
 
 /// Runtime database metrics.
@@ -347,6 +394,11 @@ pub struct DatabaseMetrics {
     pub query_digests: Vec<QueryDigest>,
     pub active_lock_waits: Vec<ActiveLockWait>,
     pub active_connections: Option<u64>,
+    /// Whether performance_schema digest collection actually ran. Without this, an
+    /// empty digest list from a disabled performance_schema reads as "no slow queries".
+    pub digest_collection: ProbeOutcome,
+    /// Whether lock-wait collection actually ran.
+    pub lock_collection: ProbeOutcome,
 }
 
 /// Environment and host metadata.
@@ -381,6 +433,9 @@ pub struct SanitizedEnvConfig {
     pub opensearch_host: Option<String>,
     pub opensearch_port: Option<u16>,
     pub rabbitmq_host: Option<String>,
+    /// `http_cache_hosts` from env.php. Non-empty means Magento is configured to
+    /// purge a Varnish/proxy tier, which is what "Varnish configured" actually means.
+    pub http_cache_hosts: Vec<String>,
 }
 
 /// Redis runtime status.
@@ -388,6 +443,10 @@ pub struct SanitizedEnvConfig {
 pub struct RedisStatus {
     pub is_configured: bool,
     pub is_reachable: bool,
+    /// `host:port` actually probed, so shared-instance metrics can be recognised.
+    pub endpoint: Option<String>,
+    /// Why the probe failed, when it did.
+    pub probe: ProbeOutcome,
     pub version: Option<String>,
     pub used_memory_bytes: Option<u64>,
     pub used_memory_peak_bytes: Option<u64>,
@@ -415,8 +474,16 @@ pub struct OpenSearchStatus {
     pub active_primary_shards: Option<u32>,
     pub active_shards: Option<u32>,
     pub unassigned_shards: Option<u32>,
+    pub number_of_data_nodes: Option<u32>,
     pub has_catalog_index: bool,
     pub catalog_docs_count: Option<u64>,
+    /// Whether the index listing probe succeeded. When it did not, `has_catalog_index
+    /// == false` means "unknown", never "missing".
+    pub catalog_index_probe: ProbeOutcome,
+    /// Catalog-ish index names discovered, whatever index prefix the store uses.
+    pub catalog_index_names: Vec<String>,
+    /// Why the health probe failed, when it did.
+    pub probe: ProbeOutcome,
 }
 
 /// OPcache status.
@@ -428,21 +495,72 @@ pub struct OpcacheStatus {
     pub validate_timestamps: Option<bool>,
 }
 
+/// Where PHP-FPM worker numbers came from. Saturation and queue depth are only
+/// trustworthy from the FPM scoreboard, so the source travels with the metrics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkerMetricSource {
+    /// No pool config and no running processes were found: PHP-FPM is not here.
+    #[default]
+    NotDetected,
+    /// A pool config was parsed, but no live worker data is available.
+    ConfigOnly,
+    /// Workers were counted by scanning /proc. Approximate: a worker blocked on
+    /// MySQL or an outbound HTTP call is asleep, not running, so "active" undercounts.
+    ProcScan,
+    /// PHP-FPM's own status page, the only source with a true active count and queue.
+    FpmStatus,
+}
+
+impl WorkerMetricSource {
+    /// True only for a source that reports a genuine active-worker count and listen
+    /// queue, which is what saturation alerting requires.
+    pub fn has_reliable_saturation(&self) -> bool {
+        matches!(self, Self::FpmStatus)
+    }
+}
+
+impl std::fmt::Display for WorkerMetricSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotDetected => write!(f, "not detected"),
+            Self::ConfigOnly => write!(f, "pool config only"),
+            Self::ProcScan => write!(f, "/proc scan (approximate)"),
+            Self::FpmStatus => write!(f, "PHP-FPM status page"),
+        }
+    }
+}
+
 /// PHP-FPM pool status and worker pressure metrics.
+///
+/// Every measurement is optional: a value is `None` when it was not measured, so no
+/// downstream rule can mistake a default for an observation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PhpWorkerMetrics {
     pub is_detected: bool,
-    pub pool_name: String,
-    pub process_manager: String,
-    pub active_workers: usize,
-    pub idle_workers: usize,
-    pub total_workers: usize,
-    pub max_children: usize,
-    pub listen_queue: usize,
-    pub max_children_reached: u64,
-    pub saturation_pct: f64,
-    pub estimated_worker_memory_mb: f64,
-    pub total_pool_memory_mb: f64,
+    pub source: WorkerMetricSource,
+    /// Where the numbers came from: a pool config path, or a status URL.
+    pub origin: Option<String>,
+    pub pool_name: Option<String>,
+    pub process_manager: Option<String>,
+    pub active_workers: Option<usize>,
+    pub idle_workers: Option<usize>,
+    pub total_workers: Option<usize>,
+    /// `pm.max_children` as configured. `None` when no pool config was found.
+    pub max_children: Option<usize>,
+    /// Pending connections on the listen socket. Only the status page reports this.
+    pub listen_queue: Option<usize>,
+    pub listen_queue_len: Option<usize>,
+    /// FPM's cumulative "max children reached" counter, not a derived boolean.
+    pub max_children_reached: Option<u64>,
+    pub slow_requests: Option<u64>,
+    pub saturation_pct: Option<f64>,
+    /// Average worker RSS. Measured from /proc when workers are visible, otherwise
+    /// an estimate; `worker_memory_measured` says which.
+    pub worker_memory_mb: Option<f64>,
+    pub worker_memory_measured: bool,
+    pub total_pool_memory_mb: Option<f64>,
+    pub host_total_memory_mb: Option<f64>,
+    /// Only ever true from a real max_children and a real host memory figure.
     pub oom_risk: bool,
 }
 
@@ -481,15 +599,53 @@ pub struct UncacheableBlock {
     pub line: usize,
 }
 
+/// Evidence that the probed port is really a Varnish/proxy tier and not just a
+/// web server that happened to accept a TCP connection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VarnishProbeResult {
+    pub endpoint: Option<String>,
+    pub outcome: ProbeOutcome,
+    pub http_status: Option<u16>,
+    /// `Via` response header, which Varnish stamps with its own name and version.
+    pub via_header: Option<String>,
+    /// `X-Varnish` request-id header.
+    pub x_varnish_header: Option<String>,
+    pub age_header: Option<String>,
+    pub x_magento_cache_debug: Option<String>,
+    /// True only when a header positively identifies Varnish.
+    pub identified_as_varnish: bool,
+    pub server_header: Option<String>,
+}
+
 /// FPC and Reverse Proxy status.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FpcProbeStatus {
     pub engine: FpcEngine,
+    /// From env.php `http_cache_hosts`: what the store is configured to purge.
     pub is_varnish_configured: bool,
+    /// From a real HTTP response that identified Varnish. Independent of the above.
     pub is_varnish_reachable: bool,
     pub varnish_host: Option<String>,
     pub varnish_port: Option<u16>,
+    pub varnish_probe: VarnishProbeResult,
     pub uncacheable_blocks: Vec<UncacheableBlock>,
+}
+
+/// Nginx `stub_status` counters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NginxStatus {
+    pub is_detected: bool,
+    pub endpoint: Option<String>,
+    pub probe: ProbeOutcome,
+    pub active_connections: Option<u64>,
+    pub accepted: Option<u64>,
+    pub handled: Option<u64>,
+    pub requests: Option<u64>,
+    pub reading: Option<u64>,
+    pub writing: Option<u64>,
+    pub waiting: Option<u64>,
+    /// accepted - handled: connections dropped before being served.
+    pub dropped: Option<u64>,
 }
 
 /// Host & Runtime state.
@@ -502,6 +658,7 @@ pub struct RuntimeState {
     pub opcache: OpcacheStatus,
     pub php_workers: PhpWorkerMetrics,
     pub fpc: FpcProbeStatus,
+    pub nginx: NginxStatus,
     pub web_server: Option<String>,
 }
 

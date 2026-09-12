@@ -43,13 +43,21 @@ pub fn render_terminal_report(
     if !installation.runtime.fpc.uncacheable_blocks.is_empty() {
         runtime_notes.push(format!("FPC: {} uncacheable layout block(s)", installation.runtime.fpc.uncacheable_blocks.len()));
     }
-    if installation.runtime.php_workers.is_detected {
-        runtime_notes.push(format!(
-            "PHP-FPM: {}/{} workers ({:.0}%)",
-            installation.runtime.php_workers.active_workers,
-            installation.runtime.php_workers.max_children,
-            installation.runtime.php_workers.saturation_pct
-        ));
+    let fpm = &installation.runtime.php_workers;
+    if fpm.is_detected {
+        // Only print figures that were actually measured, and say where they came from,
+        // so an approximate /proc reading is not mistaken for a scoreboard reading.
+        let workers = match (fpm.active_workers, fpm.max_children) {
+            (Some(active), Some(max)) => format!("{}/{} workers", active, max),
+            (Some(active), None) => format!("{} workers active", active),
+            (None, Some(max)) => format!("max_children {}", max),
+            (None, None) => "detected".to_string(),
+        };
+        let saturation = fpm
+            .saturation_pct
+            .map(|s| format!(" ({:.0}%)", s))
+            .unwrap_or_default();
+        runtime_notes.push(format!("PHP-FPM: {}{} via {}", workers, saturation, fpm.source));
     }
     if !installation.database_metrics.query_digests.is_empty() {
         runtime_notes.push(format!("SQL Digests: {} tracked", installation.database_metrics.query_digests.len()));

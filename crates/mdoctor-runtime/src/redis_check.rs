@@ -9,6 +9,28 @@ pub enum RedisIssue {
     SameDatabaseForCacheAndPageCache { cache_db: String, fpc_db: String },
 }
 
+impl std::fmt::Display for RedisIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SameDatabaseForSessionAndCache { session_db, cache_db } => write!(
+                f,
+                "Sessions (db {}) and the default cache (db {}) share one Redis database: a cache flush destroys active sessions",
+                session_db, cache_db
+            ),
+            Self::SameDatabaseForSessionAndPageCache { session_db, fpc_db } => write!(
+                f,
+                "Sessions (db {}) and the page cache (db {}) share one Redis database: an FPC flush destroys active sessions",
+                session_db, fpc_db
+            ),
+            Self::SameDatabaseForCacheAndPageCache { cache_db, fpc_db } => write!(
+                f,
+                "The default cache (db {}) and page cache (db {}) share one Redis database: flushing either clears both",
+                cache_db, fpc_db
+            ),
+        }
+    }
+}
+
 /// Determine if two Redis endpoints point to the same Redis instance.
 /// Returns false if both hosts/instances are specified and are clearly distinct.
 fn is_same_redis_instance(host_a: Option<&str>, host_b: Option<&str>) -> bool {

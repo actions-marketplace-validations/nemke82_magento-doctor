@@ -1,5 +1,6 @@
 //! CLI entry point for Magento Doctor (mdoctor).
 
+use std::time::Duration;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -8,8 +9,9 @@ use colored::*;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, Color, ContentArrangement, Table};
 use mdoctor_core::{
-    calculate_uninstall_impact, compare_installations, DiagnosticSnapshot, HealthScore,
-    MagentoInstallation, SafetyLevel, ScanBudget, Severity, CALVER_VERSION,
+    calculate_uninstall_impact, compare_installations, DiagnosticSnapshot, Endpoint, HealthScore,
+    HttpTarget, MagentoInstallation, RemoteTargets, SafetyLevel, ScanBudget, Severity,
+    CALVER_VERSION,
 };
 use mdoctor_db::inspect_live_database;
 use mdoctor_magento::{collect_installation, discover_magento_root};
@@ -24,7 +26,9 @@ use mdoctor_rules::{
     CrossAnalysisEngine,
 };
 use mdoctor_runtime::{
-    evaluate_fpc, inspect_opensearch, inspect_php_fpm, inspect_redis, probe_varnish,
+    evaluate_fpc, inspect_nginx, inspect_opensearch, inspect_php_fpm, inspect_php_fpm_remote,
+    inspect_redis, merge_local_sizing, probe_storefront_cache, probe_varnish,
+    DEFAULT_OPENSEARCH_PORT, DEFAULT_REDIS_PORT, DEFAULT_VARNISH_PORT,
 };
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,8 +63,149 @@ struct Cli {
     )]
     verbose: u8,
 
+    #[command(flatten)]
+    endpoints: EndpointArgs,
+
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+/// Where each service lives, for clustered stores and jump-host runs.
+///
+/// Without these, mdoctor discovers services from `app/etc/env.php` and the local host,
+/// which only works when it runs on the store's own node.
+#[derive(clap::Args, Debug, Default)]
+#[command(next_help_heading = "Service endpoints (clustered / jump-host runs)")]
+struct EndpointArgs {
+    #[arg(
+        long,
+        global = true,
+        value_name = "FILE",
+        help = "Endpoint config file (TOML). Defaults to mdoctor.toml in the Magento root or working directory"
+    )]
+    config: Option<PathBuf>,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "HOST[:PORT]",
+        help = "Varnish address to probe over HTTP (default port 6081)"
+    )]
+    varnish: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "URL",
+        help = "PHP-FPM status page, e.g. http://web-1.internal/status (needs pm.status_path)"
+    )]
+    fpm_status: Option<String>,
+
+    #[arg(long, global = true, value_name = "FILE", help = "PHP-FPM pool config path")]
+    fpm_conf: Option<PathBuf>,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "URL",
+        help = "Nginx stub_status page, e.g. http://web-1.internal/nginx_status"
+    )]
+    nginx_status: Option<String>,
+
+    #[arg(long, global = true, value_name = "HOST[:PORT]", help = "Default/cache Redis or Valkey instance")]
+    redis_cache: Option<String>,
+
+    #[arg(long, global = true, value_name = "HOST[:PORT]", help = "Session Redis or Valkey instance")]
+    redis_session: Option<String>,
+
+    #[arg(long, global = true, value_name = "HOST[:PORT]", help = "Page-cache Redis or Valkey instance")]
+    redis_page_cache: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "PASSWORD",
+        env = "MDOCTOR_REDIS_PASSWORD",
+        hide_env_values = true,
+        help = "Redis password. Prefer the MDOCTOR_REDIS_PASSWORD environment variable to keep it out of shell history"
+    )]
+    redis_password: Option<String>,
+
+    #[arg(long, global = true, value_name = "HOST[:PORT]", help = "OpenSearch/Elasticsearch node (default port 9200)")]
+    opensearch: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "USER:PASSWORD",
+        env = "MDOCTOR_OPENSEARCH_AUTH",
+        hide_env_values = true,
+        help = "OpenSearch basic-auth credentials. Prefer the MDOCTOR_OPENSEARCH_AUTH environment variable"
+    )]
+    opensearch_auth: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "URL",
+        help = "Storefront URL for cache-header probing, e.g. http://shop.internal/"
+    )]
+    storefront_url: Option<String>,
+}
+
+impl EndpointArgs {
+    /// Converts the flags into overrides, reporting the first malformed value.
+    fn to_targets(&self) -> Result<RemoteTargets, String> {
+        let endpoint = |raw: &Option<String>, default_port: u16, flag: &str| {
+            raw.as_deref()
+                .map(|v| Endpoint::parse(v, default_port).map_err(|e| format!("--{}: {}", flag, e)))
+                .transpose()
+        };
+        let http = |raw: &Option<String>, default_port: u16, flag: &str| {
+            raw.as_deref()
+                .map(|v| HttpTarget::parse(v, default_port).map_err(|e| format!("--{}: {}", flag, e)))
+                .transpose()
+        };
+
+        Ok(RemoteTargets {
+            varnish: endpoint(&self.varnish, DEFAULT_VARNISH_PORT, "varnish")?,
+            fpm_status_url: http(&self.fpm_status, 80, "fpm-status")?,
+            fpm_conf: self.fpm_conf.clone(),
+            nginx_status_url: http(&self.nginx_status, 80, "nginx-status")?,
+            redis_cache: endpoint(&self.redis_cache, DEFAULT_REDIS_PORT, "redis-cache")?,
+            redis_session: endpoint(&self.redis_session, DEFAULT_REDIS_PORT, "redis-session")?,
+            redis_page_cache: endpoint(&self.redis_page_cache, DEFAULT_REDIS_PORT, "redis-page-cache")?,
+            opensearch: endpoint(&self.opensearch, DEFAULT_OPENSEARCH_PORT, "opensearch")?,
+            storefront_url: http(&self.storefront_url, 80, "storefront-url")?,
+            redis_password: self.redis_password.clone(),
+            opensearch_auth: self.opensearch_auth.clone(),
+        })
+    }
+}
+
+/// Resolves endpoint overrides from the config file and the command line.
+///
+/// File values are the baseline; explicit flags win, so a checked-in `mdoctor.toml` can
+/// describe the cluster while a flag overrides one service for a single run.
+fn resolve_targets(args: &EndpointArgs, magento_root: Option<&Path>) -> Result<RemoteTargets, String> {
+    let mut targets = RemoteTargets::default();
+
+    if let Some(path) = &args.config {
+        // An explicitly requested config file that cannot be read is an error, not a
+        // silent fallback to local discovery.
+        targets = RemoteTargets::load(path).map_err(|e| e.to_string())?;
+    } else if let Some((path, loaded)) = RemoteTargets::discover(magento_root) {
+        match loaded {
+            Ok(t) => {
+                eprintln!("{} endpoint overrides from {}", "Using".dimmed(), path.display());
+                targets = t;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+
+    targets.overlay(args.to_targets()?);
+    Ok(targets)
 }
 
 #[derive(Subcommand)]
@@ -104,6 +249,9 @@ enum Commands {
     /// OpenSearch cluster health, shard allocation, and catalog index status
     #[command(name = "opensearch", alias = "open-search", alias = "search")]
     OpenSearch,
+
+    /// Nginx connection pressure and dropped connections via stub_status
+    Nginx,
 
     /// Compare current store state against a baseline snapshot to detect configuration drift
     Compare {
@@ -215,6 +363,17 @@ async fn main() -> ExitCode {
         tracing_subscriber::fmt::init();
     }
 
+    // Resolve service endpoints before dispatch: a bad endpoint should fail loudly
+    // here rather than silently degrade into probing the wrong host.
+    let targets = match resolve_targets(&cli.endpoints, cli.root.as_deref()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{}: {}", "Error".red().bold(), e);
+            return ExitCode::from(3);
+        }
+    };
+    let targets = &targets;
+
     // Default to 'scan' if no subcommand provided
     let command = cli.command.unwrap_or(Commands::Scan {
         offline: false,
@@ -225,33 +384,34 @@ async fn main() -> ExitCode {
 
     match command {
         Commands::Investigate { symptom, format } => {
-            handle_investigate(cli.root.as_deref(), symptom.as_deref(), format).await
+            handle_investigate(cli.root.as_deref(), symptom.as_deref(), format, targets).await
         }
-        Commands::Redis => handle_redis(cli.root.as_deref()).await,
-        Commands::Fpc => handle_fpc(cli.root.as_deref()).await,
-        Commands::Fpm => handle_fpm(cli.root.as_deref()).await,
-        Commands::OpenSearch => handle_opensearch(cli.root.as_deref()).await,
+        Commands::Redis => handle_redis(cli.root.as_deref(), targets).await,
+        Commands::Fpc => handle_fpc(cli.root.as_deref(), targets).await,
+        Commands::Fpm => handle_fpm(cli.root.as_deref(), targets).await,
+        Commands::OpenSearch => handle_opensearch(cli.root.as_deref(), targets).await,
+        Commands::Nginx => handle_nginx(cli.root.as_deref(), targets).await,
         Commands::Explain { rule_id } => {
             handle_explain(&rule_id);
             ExitCode::from(0)
         }
         Commands::Baseline { action } => match action {
             BaselineAction::Create { output } => {
-                handle_baseline_create(cli.root.as_deref(), output).await
+                handle_baseline_create(cli.root.as_deref(), output, targets).await
             }
             BaselineAction::Compare { baseline_file, format } => {
-                handle_baseline_compare(cli.root.as_deref(), &baseline_file, format).await
+                handle_baseline_compare(cli.root.as_deref(), &baseline_file, format, targets).await
             }
         },
         Commands::Compare { baseline_file, format } => {
-            handle_baseline_compare(cli.root.as_deref(), &baseline_file, format).await
+            handle_baseline_compare(cli.root.as_deref(), &baseline_file, format, targets).await
         }
         Commands::Impact { filter } => {
-            handle_modules_impact(cli.root.as_deref(), filter.as_deref()).await
+            handle_modules_impact(cli.root.as_deref(), filter.as_deref(), targets).await
         }
         Commands::Snapshot { action } => match action {
             SnapshotAction::Create { output } => {
-                handle_snapshot_create(cli.root.as_deref(), output).await
+                handle_snapshot_create(cli.root.as_deref(), output, targets).await
             }
             SnapshotAction::Analyze { file } => handle_snapshot_analyze(&file),
         },
@@ -260,29 +420,29 @@ async fn main() -> ExitCode {
             deep,
             budget,
             format,
-        } => handle_scan(cli.root.as_deref(), offline, deep, budget, format).await,
-        Commands::Doctor => handle_doctor(cli.root.as_deref()).await,
+        } => handle_scan(cli.root.as_deref(), offline, deep, budget, format, targets).await,
+        Commands::Doctor => handle_doctor(cli.root.as_deref(), targets).await,
         Commands::Modules { filter, impact } => {
             if impact {
-                handle_modules_impact(cli.root.as_deref(), filter.as_deref()).await
+                handle_modules_impact(cli.root.as_deref(), filter.as_deref(), targets).await
             } else {
-                handle_modules(cli.root.as_deref(), filter.as_deref()).await
+                handle_modules(cli.root.as_deref(), filter.as_deref(), targets).await
             }
         }
         Commands::Module { name, uninstall_impact, graph } => {
             if uninstall_impact {
-                handle_module_uninstall_impact(cli.root.as_deref(), &name).await
+                handle_module_uninstall_impact(cli.root.as_deref(), &name, targets).await
             } else if let Some(g_fmt) = graph {
-                handle_module_graph(cli.root.as_deref(), &name, g_fmt).await
+                handle_module_graph(cli.root.as_deref(), &name, g_fmt, targets).await
             } else {
-                handle_module(cli.root.as_deref(), &name).await
+                handle_module(cli.root.as_deref(), &name, targets).await
             }
         }
-        Commands::Cron => handle_cron(cli.root.as_deref()).await,
-        Commands::Indexers => handle_indexers(cli.root.as_deref()).await,
-        Commands::Db => handle_db(cli.root.as_deref()).await,
+        Commands::Cron => handle_cron(cli.root.as_deref(), targets).await,
+        Commands::Indexers => handle_indexers(cli.root.as_deref(), targets).await,
+        Commands::Db => handle_db(cli.root.as_deref(), targets).await,
         Commands::Why { target } => {
-            handle_investigate(cli.root.as_deref(), target.as_deref(), OutputFormat::Text).await
+            handle_investigate(cli.root.as_deref(), target.as_deref(), OutputFormat::Text, targets).await
         }
     }
 }
@@ -292,6 +452,7 @@ async fn build_installation_model(
     offline: bool,
     deep: bool,
     budget_secs: u64,
+    targets: &RemoteTargets,
 ) -> Result<MagentoInstallation, String> {
     let root = discover_magento_root(custom_root, None)
         .map_err(|e| format!("Discovery error: {}", e))?;
@@ -310,6 +471,7 @@ async fn build_installation_model(
         let env_php_path = root.join("app/etc/env.php");
         let parsed_env = mdoctor_magento::parse_env_php(&env_php_path);
         let raw_pass = parsed_env.raw_db_password.as_deref();
+        let probe_timeout = Duration::from_secs(3);
 
         // 1. MySQL live inspection
         if let (Some(host), Some(db), Some(user)) = (
@@ -317,7 +479,7 @@ async fn build_installation_model(
             &installation.env_config.db_name,
             &installation.env_config.db_user,
         ) {
-            let db_timeout = std::time::Duration::from_secs(budget.max_db_seconds.max(5) + 2);
+            let db_timeout = Duration::from_secs(budget.max_db_seconds.max(5) + 2);
             if let Ok(Ok(db_metrics)) = tokio::time::timeout(
                 db_timeout,
                 inspect_live_database(host, db, user, raw_pass, budget.max_db_seconds),
@@ -328,48 +490,98 @@ async fn build_installation_model(
             }
         }
 
-        // 2. PHP-FPM inspection
-        installation.runtime.php_workers = inspect_php_fpm(None);
+        // 2. PHP-FPM. A status page is the only source with a true active count and
+        // listen queue, and the only one that works against a remote node.
+        let local_fpm = inspect_php_fpm(targets.fpm_conf.as_deref());
+        installation.runtime.php_workers = match &targets.fpm_status_url {
+            Some(url) => {
+                let remote = inspect_php_fpm_remote(url, probe_timeout).await;
+                // The scoreboard knows the live numbers; local config knows
+                // pm.max_children and the host knows its RAM.
+                merge_local_sizing(remote, &local_fpm)
+            }
+            None => local_fpm,
+        };
 
-        // 3. Redis / Valkey inspection
-        if let Some(endpoint) = &installation.env_config.redis_cache_host {
-            let (host, port) = parse_host_port(endpoint, 6379);
-            if let Ok(st) = inspect_redis(&host, port, None, 2).await {
-                installation.runtime.redis_default = st;
-            }
-        }
-        if let Some(endpoint) = &installation.env_config.redis_session_host {
-            let (host, port) = parse_host_port(endpoint, 6379);
-            if let Ok(st) = inspect_redis(&host, port, None, 2).await {
-                installation.runtime.redis_session = st;
-            }
-        }
-
-        // 4. OpenSearch inspection
-        if let Some(host) = &installation.env_config.opensearch_host {
-            let port = installation.env_config.opensearch_port.unwrap_or(9200);
-            if let Ok(st) = inspect_opensearch(host, port, 2).await {
-                installation.runtime.opensearch = st;
-            }
+        // 3. Nginx, when a stub_status endpoint was supplied.
+        if let Some(url) = &targets.nginx_status_url {
+            installation.runtime.nginx = inspect_nginx(url, probe_timeout).await;
         }
 
-        // 5. Varnish / FPC reverse proxy probe
-        let is_varnish_live = probe_varnish("127.0.0.1", 6081, 1).await
-            || probe_varnish("127.0.0.1", 80, 1).await;
+        // 4. Redis / Valkey. An override wins over env.php, which is what lets a
+        // jump-host run reach instances env.php names by an unroutable internal address.
+        let redis_password = targets
+            .redis_password
+            .as_deref()
+            .or(parsed_env.raw_redis_password.as_deref());
+
+        if let Some(endpoint) = targets
+            .redis_cache
+            .clone()
+            .or_else(|| endpoint_from_env(installation.env_config.redis_cache_host.as_deref()))
+        {
+            installation.runtime.redis_default =
+                inspect_redis(&endpoint, redis_password, probe_timeout).await;
+        }
+        if let Some(endpoint) = targets
+            .redis_session
+            .clone()
+            .or_else(|| endpoint_from_env(installation.env_config.redis_session_host.as_deref()))
+        {
+            installation.runtime.redis_session =
+                inspect_redis(&endpoint, redis_password, probe_timeout).await;
+        }
+
+        // 5. OpenSearch
+        if let Some(endpoint) = targets.opensearch.clone().or_else(|| {
+            installation.env_config.opensearch_host.as_deref().and_then(|h| {
+                let port = installation.env_config.opensearch_port.unwrap_or(DEFAULT_OPENSEARCH_PORT);
+                Endpoint::parse(h, port).ok().map(|mut e| {
+                    // env.php keeps host and port in separate keys.
+                    if !h.contains(':') {
+                        e.port = port;
+                    }
+                    e
+                })
+            })
+        }) {
+            installation.runtime.opensearch =
+                inspect_opensearch(&endpoint, targets.opensearch_auth.as_deref(), probe_timeout).await;
+        }
+
+        // 6. Varnish. Probed over HTTP and identified from response headers: an open
+        // port proves nothing, since port 80 on a Magento host is nginx or Apache.
+        let varnish_probe = if let Some(endpoint) = &targets.varnish {
+            probe_varnish(endpoint, probe_timeout).await
+        } else if let Some(url) = &targets.storefront_url {
+            // No Varnish address given, but the storefront's own headers reveal a proxy.
+            probe_storefront_cache(url, probe_timeout).await
+        } else if let Some(configured) = installation.env_config.http_cache_hosts.first() {
+            match Endpoint::parse(configured, DEFAULT_VARNISH_PORT) {
+                Ok(endpoint) => probe_varnish(&endpoint, probe_timeout).await,
+                Err(_) => Default::default(),
+            }
+        } else {
+            // Nothing told us where a proxy tier is, so make no claim about one.
+            Default::default()
+        };
+
         let uncacheable = std::mem::take(&mut installation.runtime.fpc.uncacheable_blocks);
-        installation.runtime.fpc = evaluate_fpc(&installation.env_config, uncacheable, is_varnish_live);
+        installation.runtime.fpc = evaluate_fpc(&installation.env_config, uncacheable, varnish_probe);
+    } else {
+        // Offline: keep the statically parsed layout punctures, and record what env.php
+        // says about Varnish without probing anything.
+        let uncacheable = std::mem::take(&mut installation.runtime.fpc.uncacheable_blocks);
+        installation.runtime.fpc =
+            evaluate_fpc(&installation.env_config, uncacheable, Default::default());
     }
 
     Ok(installation)
 }
 
-fn parse_host_port(endpoint: &str, default_port: u16) -> (String, u16) {
-    if let Some((h, p)) = endpoint.split_once(':') {
-        let port = p.parse::<u16>().unwrap_or(default_port);
-        (h.to_string(), port)
-    } else {
-        (endpoint.to_string(), default_port)
-    }
+/// Parses a `host:port` value discovered in env.php, ignoring anything unusable.
+fn endpoint_from_env(raw: Option<&str>) -> Option<Endpoint> {
+    Endpoint::parse(raw?, DEFAULT_REDIS_PORT).ok()
 }
 
 async fn handle_scan(
@@ -378,8 +590,9 @@ async fn handle_scan(
     deep: bool,
     budget: u64,
     format: OutputFormat,
+    targets: &RemoteTargets,
 ) -> ExitCode {
-    let installation = match build_installation_model(root_opt, offline, deep, budget).await {
+    let installation = match build_installation_model(root_opt, offline, deep, budget, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -410,8 +623,8 @@ async fn handle_scan(
     }
 }
 
-async fn handle_doctor(root_opt: Option<&Path>) -> ExitCode {
-    let installation = match build_installation_model(root_opt, false, false, 30).await {
+async fn handle_doctor(root_opt: Option<&Path>, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(root_opt, false, false, 30, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -439,8 +652,8 @@ async fn handle_doctor(root_opt: Option<&Path>) -> ExitCode {
     ExitCode::from(0)
 }
 
-async fn handle_modules(root_opt: Option<&Path>, filter: Option<&str>) -> ExitCode {
-    let installation = match build_installation_model(root_opt, true, false, 30).await {
+async fn handle_modules(root_opt: Option<&Path>, filter: Option<&str>, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(root_opt, true, false, 30, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -493,8 +706,8 @@ async fn handle_modules(root_opt: Option<&Path>, filter: Option<&str>) -> ExitCo
     ExitCode::from(0)
 }
 
-async fn handle_module(root_opt: Option<&Path>, name: &str) -> ExitCode {
-    let installation = match build_installation_model(root_opt, true, false, 30).await {
+async fn handle_module(root_opt: Option<&Path>, name: &str, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(root_opt, true, false, 30, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -540,8 +753,8 @@ async fn handle_module(root_opt: Option<&Path>, name: &str) -> ExitCode {
     ExitCode::from(0)
 }
 
-async fn handle_cron(root_opt: Option<&Path>) -> ExitCode {
-    let installation = match build_installation_model(root_opt, false, false, 30).await {
+async fn handle_cron(root_opt: Option<&Path>, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(root_opt, false, false, 30, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -588,8 +801,8 @@ async fn handle_cron(root_opt: Option<&Path>) -> ExitCode {
     ExitCode::from(0)
 }
 
-async fn handle_indexers(root_opt: Option<&Path>) -> ExitCode {
-    let installation = match build_installation_model(root_opt, false, false, 30).await {
+async fn handle_indexers(root_opt: Option<&Path>, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(root_opt, false, false, 30, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -623,8 +836,8 @@ async fn handle_indexers(root_opt: Option<&Path>) -> ExitCode {
     ExitCode::from(0)
 }
 
-async fn handle_db(root_opt: Option<&Path>) -> ExitCode {
-    let installation = match build_installation_model(root_opt, false, false, 30).await {
+async fn handle_db(root_opt: Option<&Path>, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(root_opt, false, false, 30, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -671,8 +884,8 @@ fn handle_explain(rule_id: &str) {
     }
 }
 
-async fn handle_snapshot_create(custom_root: Option<&Path>, output_path: Option<PathBuf>) -> ExitCode {
-    let installation = match build_installation_model(custom_root, false, false, 60).await {
+async fn handle_snapshot_create(custom_root: Option<&Path>, output_path: Option<PathBuf>, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(custom_root, false, false, 60, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -734,8 +947,9 @@ async fn handle_investigate(
     root_opt: Option<&Path>,
     symptom: Option<&str>,
     format: OutputFormat,
+    targets: &RemoteTargets,
 ) -> ExitCode {
-    let installation = match build_installation_model(root_opt, false, false, 60).await {
+    let installation = match build_installation_model(root_opt, false, false, 60, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -764,8 +978,8 @@ async fn handle_investigate(
     }
 }
 
-async fn handle_redis(root_opt: Option<&Path>) -> ExitCode {
-    let installation = match build_installation_model(root_opt, false, false, 30).await {
+async fn handle_redis(root_opt: Option<&Path>, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(root_opt, false, false, 30, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -781,6 +995,7 @@ async fn handle_redis(root_opt: Option<&Path>) -> ExitCode {
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(vec![
             Cell::new("Instance").fg(Color::Cyan),
+            Cell::new("Endpoint").fg(Color::Cyan),
             Cell::new("Status").fg(Color::Cyan),
             Cell::new("Version").fg(Color::Cyan),
             Cell::new("Used Memory").fg(Color::Cyan),
@@ -827,6 +1042,7 @@ async fn handle_redis(root_opt: Option<&Path>) -> ExitCode {
 
         table.add_row(vec![
             Cell::new(name),
+            Cell::new(st.endpoint.as_deref().unwrap_or("-")),
             status_cell,
             Cell::new(st.version.as_deref().unwrap_or("-")),
             Cell::new(mem_str),
@@ -839,11 +1055,29 @@ async fn handle_redis(root_opt: Option<&Path>) -> ExitCode {
 
     println!("{}\n", table);
 
+    // Say why a probe failed: "unreachable" alone leaves the operator guessing between
+    // a wrong address, a firewall, and a missing password.
+    for (name, st) in &instances {
+        if !st.is_reachable {
+            if let mdoctor_core::ProbeOutcome::Failed { reason } = &st.probe {
+                println!("{} ({}): {}", name, "probe failed".yellow(), reason);
+            }
+        }
+    }
+    if instances.iter().any(|(_, st)| !st.is_reachable) {
+        println!(
+            "\n{}",
+            "If Redis runs on another node, pass --redis-cache / --redis-session (and --redis-password, or MDOCTOR_REDIS_PASSWORD)."
+                .dimmed()
+        );
+        println!();
+    }
+
     let collisions = mdoctor_runtime::check_redis_config(&installation.env_config);
     if !collisions.is_empty() {
         println!("{}", "CRITICAL REDIS CONFIGURATION CONCERN:".red().bold());
         for c in &collisions {
-            println!("  • {:?}", c);
+            println!("  • {}", c);
         }
         println!();
     }
@@ -851,8 +1085,8 @@ async fn handle_redis(root_opt: Option<&Path>) -> ExitCode {
     ExitCode::from(0)
 }
 
-async fn handle_fpc(root_opt: Option<&Path>) -> ExitCode {
-    let installation = match build_installation_model(root_opt, false, false, 30).await {
+async fn handle_fpc(root_opt: Option<&Path>, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(root_opt, false, false, 30, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -896,8 +1130,8 @@ async fn handle_fpc(root_opt: Option<&Path>) -> ExitCode {
     ExitCode::from(0)
 }
 
-async fn handle_fpm(root_opt: Option<&Path>) -> ExitCode {
-    let installation = match build_installation_model(root_opt, false, false, 30).await {
+async fn handle_fpm(root_opt: Option<&Path>, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(root_opt, false, false, 30, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -909,23 +1143,85 @@ async fn handle_fpm(root_opt: Option<&Path>) -> ExitCode {
     let fpm = &installation.runtime.php_workers;
 
     if !fpm.is_detected {
-        println!("No active PHP-FPM pools detected in standard Linux socket/process paths.");
+        println!("No PHP-FPM pool config or worker process found on this host.");
+        if let Some(origin) = &fpm.origin {
+            println!("Probe result: {}", origin.yellow());
+        }
+        println!(
+            "\n{}",
+            "If PHP-FPM runs on another node, point mdoctor at its status page:".dimmed()
+        );
+        println!("  {}", "mdoctor fpm --fpm-status http://web-1.internal/status".cyan());
+        println!(
+            "  {}",
+            "(the pool needs pm.status_path set, and the location reachable from here)".dimmed()
+        );
         return ExitCode::from(0);
     }
 
-    println!("Pool: {}", fpm.pool_name.cyan().bold());
-    println!("Process Manager: {}", fpm.process_manager);
-    println!("Active Workers:  {}/{} ({:.1}% saturation)", fpm.active_workers, fpm.max_children, fpm.saturation_pct);
-    println!("Idle Workers:    {}", fpm.idle_workers);
-    println!("Listen Queue:    {}", fpm.listen_queue);
-    println!("Max Children Hit Count: {}", fpm.max_children_reached);
-    println!("Estimated Worker Footprint: {:.0} MB", fpm.estimated_worker_memory_mb);
-    println!("Potential Pool Memory:      {:.0} MB", fpm.total_pool_memory_mb);
+    // Show only measured values; a dash means "not measured", never a default.
+    let show_usize = |v: Option<usize>| v.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+    let show_u64 = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+
+    println!("Metric source:   {}", fpm.source.to_string().cyan().bold());
+    if let Some(origin) = &fpm.origin {
+        println!("Read from:       {}", origin);
+    }
+    println!("Pool:            {}", fpm.pool_name.as_deref().unwrap_or("-").cyan().bold());
+    println!("Process Manager: {}", fpm.process_manager.as_deref().unwrap_or("-"));
+    println!(
+        "Active Workers:  {}/{}{}",
+        show_usize(fpm.active_workers),
+        show_usize(fpm.max_children),
+        fpm.saturation_pct
+            .map(|s| format!(" ({:.1}% saturation)", s))
+            .unwrap_or_default()
+    );
+    println!("Idle Workers:    {}", show_usize(fpm.idle_workers));
+    println!("Listen Queue:    {}", show_usize(fpm.listen_queue));
+    println!("Max Children Reached (cumulative): {}", show_u64(fpm.max_children_reached));
+    println!("Slow Requests:   {}", show_u64(fpm.slow_requests));
+    match fpm.worker_memory_mb {
+        Some(mem) => println!(
+            "Worker Footprint: {:.0} MB ({})",
+            mem,
+            if fpm.worker_memory_measured {
+                "measured from process RSS"
+            } else {
+                "estimated; no live worker to measure"
+            }
+        ),
+        None => println!("Worker Footprint: -"),
+    }
+    if let Some(pool) = fpm.total_pool_memory_mb {
+        println!("Potential Pool Memory: {:.0} MB", pool);
+    }
+    if let Some(host) = fpm.host_total_memory_mb {
+        println!("Host Memory:     {:.0} MB", host);
+    }
 
     if fpm.oom_risk {
-        println!("\n{}", "CRITICAL: Pool memory exceeds host RAM capacity. Linux OOM-killer risk under traffic spikes!".red().bold());
-    } else if fpm.saturation_pct > 85.0 {
-        println!("\n{}", "WARNING: Worker saturation > 85%. Requests risk queuing or timing out with HTTP 504.".yellow().bold());
+        println!(
+            "\n{}",
+            "CRITICAL: pm.max_children x worker footprint exceeds 80% of host RAM. OOM-killer risk under traffic spikes."
+                .red()
+                .bold()
+        );
+    } else if !fpm.source.has_reliable_saturation() {
+        // Saying so is the point: a /proc scan cannot see the listen queue, and counts
+        // a worker blocked on MySQL as idle.
+        println!(
+            "\n{}",
+            "Note: saturation and listen queue cannot be measured from this source. Enable pm.status_path and pass --fpm-status for reliable worker pressure figures."
+                .yellow()
+        );
+    } else if fpm.saturation_pct.is_some_and(|s| s > 85.0) || fpm.listen_queue.is_some_and(|q| q > 0) {
+        println!(
+            "\n{}",
+            "WARNING: workers are saturated or requests are queuing; expect HTTP 504s under load."
+                .yellow()
+                .bold()
+        );
     } else {
         println!("\n{}", "✓ Worker pool operating within safe memory and concurrency bounds.".green().bold());
     }
@@ -933,8 +1229,62 @@ async fn handle_fpm(root_opt: Option<&Path>) -> ExitCode {
     ExitCode::from(0)
 }
 
-async fn handle_opensearch(root_opt: Option<&Path>) -> ExitCode {
-    let installation = match build_installation_model(root_opt, false, false, 30).await {
+async fn handle_nginx(root_opt: Option<&Path>, targets: &RemoteTargets) -> ExitCode {
+    if targets.nginx_status_url.is_none() {
+        println!("\n{} - Nginx Web Tier Telemetry\n", CALVER_VERSION.cyan().bold());
+        println!("No Nginx stub_status endpoint configured.");
+        println!(
+            "\n{}",
+            "Add `stub_status;` to a restricted location block, then point mdoctor at it:".dimmed()
+        );
+        println!("  {}", "mdoctor nginx --nginx-status http://web-1.internal/nginx_status".cyan());
+        return ExitCode::from(0);
+    }
+
+    let installation = match build_installation_model(root_opt, false, false, 30, targets).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{}: {}", "Error".red().bold(), e);
+            return ExitCode::from(3);
+        }
+    };
+
+    println!("\n{} - Nginx Web Tier Telemetry\n", CALVER_VERSION.cyan().bold());
+    let nginx = &installation.runtime.nginx;
+
+    println!("Endpoint: {}", nginx.endpoint.as_deref().unwrap_or("-"));
+    if !nginx.is_detected {
+        println!("Probe:    {}", nginx.probe.to_string().yellow());
+        return ExitCode::from(0);
+    }
+
+    let show = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+    println!("Active Connections: {}", show(nginx.active_connections));
+    println!("Reading / Writing / Waiting: {} / {} / {}", show(nginx.reading), show(nginx.writing), show(nginx.waiting));
+    println!("Accepted / Handled: {} / {}", show(nginx.accepted), show(nginx.handled));
+    println!("Total Requests:     {}", show(nginx.requests));
+
+    match nginx.dropped {
+        // accepted - handled is connections Nginx accepted but never served, which
+        // usually means it hit a worker_connections or file-descriptor limit.
+        Some(dropped) if dropped > 0 => println!(
+            "\n{}",
+            format!(
+                "WARNING: {} connection(s) accepted but never handled. Check worker_connections and open file limits.",
+                dropped
+            )
+            .yellow()
+            .bold()
+        ),
+        Some(_) => println!("\n{}", "✓ No dropped connections.".green().bold()),
+        None => {}
+    }
+
+    ExitCode::from(0)
+}
+
+async fn handle_opensearch(root_opt: Option<&Path>, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(root_opt, false, false, 30, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -967,9 +1317,9 @@ async fn handle_opensearch(root_opt: Option<&Path>) -> ExitCode {
     ExitCode::from(0)
 }
 
-async fn handle_baseline_create(custom_root: Option<&Path>, output_path: Option<PathBuf>) -> ExitCode {
+async fn handle_baseline_create(custom_root: Option<&Path>, output_path: Option<PathBuf>, targets: &RemoteTargets) -> ExitCode {
     let target_file = output_path.unwrap_or_else(|| PathBuf::from("mdoctor-baseline.json"));
-    let installation = match build_installation_model(custom_root, false, false, 60).await {
+    let installation = match build_installation_model(custom_root, false, false, 60, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -1003,6 +1353,7 @@ async fn handle_baseline_compare(
     custom_root: Option<&Path>,
     baseline_file: &Path,
     format: OutputFormat,
+    targets: &RemoteTargets,
 ) -> ExitCode {
     let content = match std::fs::read_to_string(baseline_file) {
         Ok(c) => c,
@@ -1020,7 +1371,7 @@ async fn handle_baseline_compare(
         }
     };
 
-    let current_inst = match build_installation_model(custom_root, false, false, 60).await {
+    let current_inst = match build_installation_model(custom_root, false, false, 60, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -1054,8 +1405,8 @@ async fn handle_baseline_compare(
     }
 }
 
-async fn handle_modules_impact(root_opt: Option<&Path>, filter: Option<&str>) -> ExitCode {
-    let installation = match build_installation_model(root_opt, true, false, 30).await {
+async fn handle_modules_impact(root_opt: Option<&Path>, filter: Option<&str>, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(root_opt, true, false, 30, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -1075,8 +1426,8 @@ async fn handle_modules_impact(root_opt: Option<&Path>, filter: Option<&str>) ->
     ExitCode::from(0)
 }
 
-async fn handle_module_uninstall_impact(root_opt: Option<&Path>, name: &str) -> ExitCode {
-    let installation = match build_installation_model(root_opt, true, false, 30).await {
+async fn handle_module_uninstall_impact(root_opt: Option<&Path>, name: &str, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(root_opt, true, false, 30, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -1102,8 +1453,8 @@ async fn handle_module_uninstall_impact(root_opt: Option<&Path>, name: &str) -> 
     }
 }
 
-async fn handle_module_graph(root_opt: Option<&Path>, name: &str, format: GraphFormat) -> ExitCode {
-    let installation = match build_installation_model(root_opt, true, false, 30).await {
+async fn handle_module_graph(root_opt: Option<&Path>, name: &str, format: GraphFormat, targets: &RemoteTargets) -> ExitCode {
+    let installation = match build_installation_model(root_opt, true, false, 30, targets).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
