@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/nemke82/magento-doctor/actions/workflows/ci.yml"><img src="https://github.com/nemke82/magento-doctor/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://nemke82.github.io/magento-doctor/"><img src="https://img.shields.io/badge/docs-interactive_site-00f0ff.svg" alt="Documentation" /></a>
-  <a href="https://github.com/nemke82/magento-doctor/releases"><img src="https://img.shields.io/badge/release-v2026.09.06-blue.svg" alt="Release" /></a>
+  <a href="https://github.com/nemke82/magento-doctor/releases"><img src="https://img.shields.io/badge/release-v2026.09.12-blue.svg" alt="Release" /></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT" /></a>
   <img src="https://img.shields.io/badge/Rust-1.75+-orange.svg" alt="Rust 1.75+" />
   <img src="https://img.shields.io/badge/Magento-2.4.4_--_2.4.9-orange.svg" alt="Magento 2.4.4 - 2.4.9" />
@@ -31,9 +31,9 @@ Collectors
     ↓
 Normalized Installation Model (MagentoInstallation)
     ↓
-Cross-Analysis Correlation Engine
+Cross-Analysis Correlation Engine & Investigation Matrix
     ↓
-Evidence-First Diagnosis & Recommendations
+Evidence-First Diagnosis, Causal Chains & Prescriptions
 ```
 
 Every analyzer operates against a normalized internal representation of the store rather than grep heuristics. This allows Magento Doctor to correlate facts across different subsystems to answer critical questions:
@@ -41,14 +41,15 @@ Every analyzer operates against a normalized internal representation of the stor
 - *Does this third-party module define an around plugin on a checkout hot path that makes synchronous HTTP calls?*
 - *Does a vendor cron job run every minute while having an observed median runtime of 74 seconds, creating an overlap storm?*
 - *Does a collection loop execute N+1 repository loads (`$repo->getById()`) inside a loop?*
-- *Which declarative schema tables or indexes are missing or redundant in the physical database?*
+- *Which storefront layout files declare `cacheable="false"` and silently destroy Full Page Caching across the store?*
+- *Is the Redis session store configured with an eviction policy that silently drops customer shopping carts?*
 
 ---
 
 ## Example Output
 
 ```text
-Magento Doctor v2026.09.06
+Magento Doctor v2026.09.12
 
 Magento Open Source 2.4.7-p3
 Mode: production
@@ -176,8 +177,13 @@ MAGENTO_ROOT=/var/www/magento mdoctor scan
 
 | Command | Description |
 |---|---|
+| `mdoctor investigate [symptom]` | Multi-dimensional root cause engine synthesizing telemetry into causal failure chains |
 | `mdoctor scan` | Run full comprehensive scan across code, configuration, database schema, and cron |
 | `mdoctor doctor` | Fast operational health check highlighting critical blockages |
+| `mdoctor fpc` | Full Page Cache (FPC), Varnish reachability, and layout `cacheable="false"` audit |
+| `mdoctor redis` | Redis & Valkey deep internals: memory, fragmentation, eviction policy & hit ratios |
+| `mdoctor fpm` | PHP-FPM worker saturation gauge, process manager, listen queue & OOM risk |
+| `mdoctor opensearch` | OpenSearch cluster health, shard allocation, and catalog search index status |
 | `mdoctor baseline create` | Export current store state as a baseline for drift comparison |
 | `mdoctor compare <baseline>` | Compare store against baseline to detect configuration drift and regressions |
 | `mdoctor modules` | Module inventory, classification, and integration footprint metrics |
@@ -191,9 +197,88 @@ MAGENTO_ROOT=/var/www/magento mdoctor scan
 | `mdoctor explain <RULE_ID>` | In-depth engineering explanation with manual verification commands |
 | `mdoctor snapshot create` | Export sanitized store snapshot safe for sharing in GitHub issues |
 | `mdoctor snapshot analyze <file>` | Analyze an exported snapshot offline |
-| `mdoctor why slow` | Targeted bottleneck triage across database, cron, hot-path plugins, and Redis |
+| `mdoctor why [symptom]` | Fast triage alias for `mdoctor investigate` |
 
 ---
+
+### Root Cause Investigation Engine (`mdoctor investigate`)
+
+Unlike traditional scanners that emit dozens of isolated warnings, `mdoctor investigate` combines MySQL performance schema digests, Redis memory telemetry, PHP worker queue status, FPC layout punctures, and AST code analysis to produce **actionable causal chains**:
+
+```bash
+# Auto-diagnose primary production failure modes
+mdoctor investigate
+
+# Focus on specific symptoms
+mdoctor investigate 504
+mdoctor investigate checkout
+mdoctor investigate fpc
+mdoctor investigate search
+```
+
+```text
+═══ MAGENTO DOCTOR: ROOT CAUSE INVESTIGATION ═══
+Multi-dimensional root-cause correlation across Runtime, Database, Cache, and Code
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ [ROOT CAUSE #1] Synchronous External Network Calls Intercepting Checkout Hot Path
+│ HIGH CONFIDENCE | IMPACT: 96/100 (CRITICAL)
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Summary:
+│   A custom extension intercepts the Magento order placement transaction with
+│   an around plugin that executes synchronous external HTTP requests, freezing checkout.
+│
+│ Causal Chain (Observed Symptom ➔ Culprit):
+│   [Symptom]   Storefront Checkout Slow or timing out quote submission during checkout
+│        ⬇
+│   [Culprit]   Vendor_Payment  Around plugin 'vendor_payment_quote_around' makes
+│                               synchronous HTTP call ($this->client->request()) at di.xml:13
+│
+│ Implicated Modules: Vendor_Payment
+│
+│ Recommended Action Plan:
+│   1. Refactor around plugin 'vendor_payment_quote_around' to execute network calls asynchronously.
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ [ROOT CAUSE #2] Storefront Full Page Cache Punctured by Custom Layout XML Declarations
+│ HIGH CONFIDENCE | IMPACT: 95/100 (CRITICAL)
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Summary:
+│   A third-party extension includes cacheable="false" in a catalog layout file,
+│   destroying edge caching and forcing full PHP compilation on every page hit.
+│
+│ Causal Chain (Observed Symptom ➔ Culprit):
+│   [Symptom]   Full Page Cache 1 storefront layout block(s) explicitly declare cacheable="false"
+│        ⬇
+│   [Culprit]   Vendor_Feed     Block 'vendor.feed.tracker' in catalog_product_view disables page caching
+│
+│ Implicated Modules: Vendor_Feed
+│
+│ Recommended Action Plan:
+│   1. Remove cacheable="false" from vendor.feed.tracker in catalog_product_view.xml.
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Deep Runtime Diagnostics
+
+Inspect each layer of your Magento 2 infrastructure with dedicated forensic tools:
+
+```bash
+# Full Page Cache & Varnish layout puncture audit
+mdoctor fpc
+
+# Redis & Valkey deep internals (memory fragmentation, eviction policy, keyspace hits)
+mdoctor redis
+
+# PHP-FPM worker pool pressure, listen queues, and host OOM risk
+mdoctor fpm
+
+# OpenSearch cluster health, shard unallocations, and catalog index presence
+mdoctor opensearch
+```
 
 ### Configuration Drift & Baseline Comparison
 
@@ -360,7 +445,11 @@ mdoctor snapshot analyze customer_audit.mdoctor
 | **Cron**        | `MD-CRON-*`| Schedule backlog, overlap storms, stuck running jobs |
 | **Indexers**    | `MD-IDX-*` | Realtime vs scheduled indexer modes, changelog backlog |
 | **Database**    | `MD-DB-*`  | Missing declared indexes, redundant left-prefix indexes, orphan tables, volatile bloat |
-| **Cache**       | `MD-CACHE-*`| Redis database collisions (session vs cache sharing DB IDs) |
+| **SQL Forensics**| `MD-SQL-*` | High latency query digests, active transaction and metadata lock waits |
+| **Cache & Redis**| `MD-CACHE-*`, `MD-RDS-*`| Redis DB collisions, session eviction hazards, fragmentation, hit ratio |
+| **FPC & Varnish**| `MD-FPC-*` | Storefront layout punctures (`cacheable="false"`), reverse proxy health |
+| **PHP Workers** | `MD-FPM-*` | PHP-FPM worker saturation, listen queue spikes, host RAM OOM risk |
+| **Search Engine**| `MD-SRC-*` | OpenSearch/Elasticsearch cluster health degradation, missing catalog indices |
 | **Performance** | `MD-PERF-*`| N+1 repository loops, synchronous HTTP calls, loop logging |
 | **Security**    | `MD-SEC-*` | Developer mode in production, world-writable directories |
 

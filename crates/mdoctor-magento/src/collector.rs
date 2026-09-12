@@ -12,6 +12,7 @@ use crate::xml::db_schema::parse_db_schema_xml;
 use crate::xml::di::parse_di_xml;
 use crate::xml::events::parse_events_xml;
 use crate::xml::indexer::parse_indexer_xml;
+use crate::xml::layout::parse_layout_xml;
 
 /// Collect static Magento installation model from disk.
 pub fn collect_installation(root: &Path) -> MagentoInstallation {
@@ -43,6 +44,7 @@ pub fn collect_installation(root: &Path) -> MagentoInstallation {
     let mut all_crons = Vec::new();
     let mut all_indexers = Vec::new();
     let mut all_tables = HashMap::new();
+    let mut all_uncacheable_blocks = Vec::new();
 
     // 5. For each module on disk, parse its XML definitions
     for module in &mut modules {
@@ -120,6 +122,22 @@ pub fn collect_installation(root: &Path) -> MagentoInstallation {
             let idxs = parse_indexer_xml(&indexer_path, &module.name);
             all_indexers.extend(idxs);
         }
+
+        // Layout XML: check view/frontend/layout and view/base/layout for uncacheable blocks
+        for layout_rel in &["view/frontend/layout", "view/base/layout"] {
+            let layout_dir = module.path.join(layout_rel);
+            if layout_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&layout_dir) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|ext| ext == "xml") {
+                            let uncacheable = parse_layout_xml(&path, &module.name);
+                            all_uncacheable_blocks.extend(uncacheable);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     installation.modules = modules;
@@ -129,6 +147,7 @@ pub fn collect_installation(root: &Path) -> MagentoInstallation {
     installation.cron_jobs = all_crons;
     installation.indexers = all_indexers;
     installation.declared_schema = DatabaseSchema { tables: all_tables };
+    installation.runtime.fpc.uncacheable_blocks = all_uncacheable_blocks;
 
     // 6. Environment metadata
     installation.environment = Environment {

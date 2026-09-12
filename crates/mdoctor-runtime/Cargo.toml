@@ -10,7 +10,9 @@ description = "PHP runtime, OPcache, Redis, OpenSearch, and filesystem inspector
 [dependencies]
 mdoctor-core.workspace = true
 mdoctor-knowledge.workspace = true
+tokio.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 walkdir.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

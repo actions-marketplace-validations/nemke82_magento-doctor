@@ -15,11 +15,16 @@ use mdoctor_db::inspect_live_database;
 use mdoctor_magento::{collect_installation, discover_magento_root};
 use mdoctor_report::{
     render_drift_json, render_drift_markdown, render_drift_terminal, render_impact_table,
-    render_json_report, render_markdown_report, render_mermaid_graph, render_sarif_report,
-    render_terminal_report, render_uninstall_terminal,
+    render_investigate_json, render_investigate_terminal, render_json_report,
+    render_markdown_report, render_mermaid_graph, render_sarif_report, render_terminal_report,
+    render_uninstall_terminal,
 };
 use mdoctor_rules::{
-    calculate_all_modules_impact, get_rule_explanation, scan_php_sources, CrossAnalysisEngine,
+    calculate_all_modules_impact, get_rule_explanation, investigate_installation, scan_php_sources,
+    CrossAnalysisEngine,
+};
+use mdoctor_runtime::{
+    evaluate_fpc, inspect_opensearch, inspect_php_fpm, inspect_redis, probe_varnish,
 };
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +65,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Multi-dimensional root cause analysis correlating runtime forensics with code
+    Investigate {
+        #[arg(help = "Focus symptom or target area (e.g. 'slow', 'checkout', '504', 'cache', 'search')")]
+        symptom: Option<String>,
+
+        #[arg(short, long, value_enum, default_value = "text", help = "Report format")]
+        format: OutputFormat,
+    },
+
     /// Run full comprehensive scan across code, configuration, database, and cron
     Scan {
         #[arg(long, help = "Run offline without connecting to live MySQL or network")]
@@ -77,6 +91,19 @@ enum Commands {
 
     /// Run quick operational health check
     Doctor,
+
+    /// Deep Redis and Valkey internals, memory fragmentation, and eviction forensics
+    Redis,
+
+    /// Full Page Cache (FPC), Varnish probe, and uncacheable layout block audit
+    Fpc,
+
+    /// PHP-FPM pool status, worker saturation, and memory OOM risk
+    Fpm,
+
+    /// OpenSearch cluster health, shard allocation, and catalog index status
+    #[command(name = "opensearch", alias = "open-search", alias = "search")]
+    OpenSearch,
 
     /// Compare current store state against a baseline snapshot to detect configuration drift
     Compare {
@@ -141,9 +168,9 @@ enum Commands {
         action: SnapshotAction,
     },
 
-    /// Identify likely performance bottlenecks
+    /// Identify likely performance bottlenecks (alias for investigate)
     Why {
-        #[arg(help = "Target issue (e.g. 'slow')")]
+        #[arg(help = "Target issue (e.g. 'slow', 'checkout', '504')")]
         target: Option<String>,
     },
 }
@@ -197,6 +224,13 @@ async fn main() -> ExitCode {
     });
 
     match command {
+        Commands::Investigate { symptom, format } => {
+            handle_investigate(cli.root.as_deref(), symptom.as_deref(), format).await
+        }
+        Commands::Redis => handle_redis(cli.root.as_deref()).await,
+        Commands::Fpc => handle_fpc(cli.root.as_deref()).await,
+        Commands::Fpm => handle_fpm(cli.root.as_deref()).await,
+        Commands::OpenSearch => handle_opensearch(cli.root.as_deref()).await,
         Commands::Explain { rule_id } => {
             handle_explain(&rule_id);
             ExitCode::from(0)
@@ -247,7 +281,9 @@ async fn main() -> ExitCode {
         Commands::Cron => handle_cron(cli.root.as_deref()).await,
         Commands::Indexers => handle_indexers(cli.root.as_deref()).await,
         Commands::Db => handle_db(cli.root.as_deref()).await,
-        Commands::Why { target } => handle_why(cli.root.as_deref(), target.as_deref()).await,
+        Commands::Why { target } => {
+            handle_investigate(cli.root.as_deref(), target.as_deref(), OutputFormat::Text).await
+        }
     }
 }
 
@@ -269,17 +305,18 @@ async fn build_installation_model(
 
     let mut installation = collect_installation(&root);
 
-    // If live MySQL is allowed and not in offline mode, attempt connection
+    // If live probes are allowed and not in offline mode, collect runtime forensics
     if !offline && budget.is_allowed(SafetyLevel::Low) {
+        let env_php_path = root.join("app/etc/env.php");
+        let parsed_env = mdoctor_magento::parse_env_php(&env_php_path);
+        let raw_pass = parsed_env.raw_db_password.as_deref();
+
+        // 1. MySQL live inspection
         if let (Some(host), Some(db), Some(user)) = (
             &installation.env_config.db_host,
             &installation.env_config.db_name,
             &installation.env_config.db_user,
         ) {
-            let env_php_path = root.join("app/etc/env.php");
-            let parsed_env = mdoctor_magento::parse_env_php(&env_php_path);
-            let raw_pass = parsed_env.raw_db_password.as_deref();
-
             let db_timeout = std::time::Duration::from_secs(budget.max_db_seconds.max(5) + 2);
             if let Ok(Ok(db_metrics)) = tokio::time::timeout(
                 db_timeout,
@@ -290,9 +327,49 @@ async fn build_installation_model(
                 installation.database_metrics = db_metrics;
             }
         }
+
+        // 2. PHP-FPM inspection
+        installation.runtime.php_workers = inspect_php_fpm(None);
+
+        // 3. Redis / Valkey inspection
+        if let Some(endpoint) = &installation.env_config.redis_cache_host {
+            let (host, port) = parse_host_port(endpoint, 6379);
+            if let Ok(st) = inspect_redis(&host, port, None, 2).await {
+                installation.runtime.redis_default = st;
+            }
+        }
+        if let Some(endpoint) = &installation.env_config.redis_session_host {
+            let (host, port) = parse_host_port(endpoint, 6379);
+            if let Ok(st) = inspect_redis(&host, port, None, 2).await {
+                installation.runtime.redis_session = st;
+            }
+        }
+
+        // 4. OpenSearch inspection
+        if let Some(host) = &installation.env_config.opensearch_host {
+            let port = installation.env_config.opensearch_port.unwrap_or(9200);
+            if let Ok(st) = inspect_opensearch(host, port, 2).await {
+                installation.runtime.opensearch = st;
+            }
+        }
+
+        // 5. Varnish / FPC reverse proxy probe
+        let is_varnish_live = probe_varnish("127.0.0.1", 6081, 1).await
+            || probe_varnish("127.0.0.1", 80, 1).await;
+        let uncacheable = std::mem::take(&mut installation.runtime.fpc.uncacheable_blocks);
+        installation.runtime.fpc = evaluate_fpc(&installation.env_config, uncacheable, is_varnish_live);
     }
 
     Ok(installation)
+}
+
+fn parse_host_port(endpoint: &str, default_port: u16) -> (String, u16) {
+    if let Some((h, p)) = endpoint.split_once(':') {
+        let port = p.parse::<u16>().unwrap_or(default_port);
+        (h.to_string(), port)
+    } else {
+        (endpoint.to_string(), default_port)
+    }
 }
 
 async fn handle_scan(
@@ -653,7 +730,11 @@ fn handle_snapshot_analyze(file: &Path) -> ExitCode {
     ExitCode::from(0)
 }
 
-async fn handle_why(root_opt: Option<&Path>, _target: Option<&str>) -> ExitCode {
+async fn handle_investigate(
+    root_opt: Option<&Path>,
+    symptom: Option<&str>,
+    format: OutputFormat,
+) -> ExitCode {
     let installation = match build_installation_model(root_opt, false, false, 60).await {
         Ok(m) => m,
         Err(e) => {
@@ -662,25 +743,226 @@ async fn handle_why(root_opt: Option<&Path>, _target: Option<&str>) -> ExitCode 
         }
     };
 
-    let findings = CrossAnalysisEngine::analyze(&installation);
+    let ast_findings = scan_php_sources(&installation);
+    let results = investigate_installation(&installation, &ast_findings, symptom);
 
-    println!("\n{} - Targeted Bottleneck Triage\n", CALVER_VERSION.cyan().bold());
-    println!("Likely Performance Contributors:\n");
-
-    let perf_findings: Vec<_> = findings
-        .iter()
-        .filter(|f| f.severity == Severity::Critical || f.severity == Severity::Warning)
-        .collect();
-
-    if perf_findings.is_empty() {
-        println!("{}", "No critical performance bottlenecks identified!".green().bold());
-    } else {
-        for (i, f) in perf_findings.iter().enumerate() {
-            println!("{}. {:<40} {} confidence", i + 1, f.title.bold(), format!("{}", f.confidence).yellow());
-            println!("   Impact: {}", f.impact);
-            println!("   Fix:    {}\n", f.recommendation.cyan());
+    let output = match format {
+        OutputFormat::Text | OutputFormat::Markdown => render_investigate_terminal(&results, symptom),
+        OutputFormat::Json | OutputFormat::Sarif => {
+            render_investigate_json(&results).unwrap_or_else(|e| format!("JSON error: {}", e))
         }
+    };
+
+    println!("{}", output);
+
+    if results.iter().any(|r| r.impact_score >= 90) {
+        ExitCode::from(2)
+    } else if !results.is_empty() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::from(0)
     }
+}
+
+async fn handle_redis(root_opt: Option<&Path>) -> ExitCode {
+    let installation = match build_installation_model(root_opt, false, false, 30).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{}: {}", "Error".red().bold(), e);
+            return ExitCode::from(3);
+        }
+    };
+
+    println!("\n{} - Redis & Valkey Deep Internals Forensics\n", CALVER_VERSION.cyan().bold());
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Instance").fg(Color::Cyan),
+            Cell::new("Status").fg(Color::Cyan),
+            Cell::new("Version").fg(Color::Cyan),
+            Cell::new("Used Memory").fg(Color::Cyan),
+            Cell::new("Fragmentation").fg(Color::Cyan),
+            Cell::new("Eviction Policy").fg(Color::Cyan),
+            Cell::new("Evicted Keys").fg(Color::Cyan),
+            Cell::new("Hit Ratio").fg(Color::Cyan),
+        ]);
+
+    let instances = [
+        ("Default / Cache", &installation.runtime.redis_default),
+        ("Session", &installation.runtime.redis_session),
+    ];
+
+    for (name, st) in &instances {
+        let status_cell = if st.is_reachable {
+            Cell::new("connected").fg(Color::Green)
+        } else if st.is_configured {
+            Cell::new("unreachable").fg(Color::Red)
+        } else {
+            Cell::new("not configured").fg(Color::DarkGrey)
+        };
+
+        let mem_str = st
+            .used_memory_bytes
+            .map(|b| format!("{} MB", b / (1024 * 1024)))
+            .unwrap_or_else(|| "-".to_string());
+
+        let frag_str = st
+            .mem_fragmentation_ratio
+            .map(|r| format!("{:.2}", r))
+            .unwrap_or_else(|| "-".to_string());
+
+        let evict_cell = match st.evicted_keys {
+            Some(k) if k > 0 && *name == "Session" => Cell::new(k.to_string()).fg(Color::Red),
+            Some(k) => Cell::new(k.to_string()),
+            None => Cell::new("-"),
+        };
+
+        let hit_str = st
+            .hit_ratio
+            .map(|r| format!("{:.1}%", r * 100.0))
+            .unwrap_or_else(|| "-".to_string());
+
+        table.add_row(vec![
+            Cell::new(name),
+            status_cell,
+            Cell::new(st.version.as_deref().unwrap_or("-")),
+            Cell::new(mem_str),
+            Cell::new(frag_str),
+            Cell::new(st.maxmemory_policy.as_deref().unwrap_or("-")),
+            evict_cell,
+            Cell::new(hit_str),
+        ]);
+    }
+
+    println!("{}\n", table);
+
+    let collisions = mdoctor_runtime::check_redis_config(&installation.env_config);
+    if !collisions.is_empty() {
+        println!("{}", "CRITICAL REDIS CONFIGURATION CONCERN:".red().bold());
+        for c in &collisions {
+            println!("  • {:?}", c);
+        }
+        println!();
+    }
+
+    ExitCode::from(0)
+}
+
+async fn handle_fpc(root_opt: Option<&Path>) -> ExitCode {
+    let installation = match build_installation_model(root_opt, false, false, 30).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{}: {}", "Error".red().bold(), e);
+            return ExitCode::from(3);
+        }
+    };
+
+    println!("\n{} - Full Page Cache (FPC) & Varnish Forensics\n", CALVER_VERSION.cyan().bold());
+    println!("FPC Engine: {}", installation.runtime.fpc.engine);
+    println!("Varnish Reverse Proxy Reachable: {}", if installation.runtime.fpc.is_varnish_reachable { "YES".green() } else { "NO / NOT DETECTED".yellow() });
+
+    let uncacheable = &installation.runtime.fpc.uncacheable_blocks;
+    println!("Uncacheable Layout Blocks (cacheable=\"false\"): {}\n", uncacheable.len());
+
+    if uncacheable.is_empty() {
+        println!("{}", "✓ No storefront layout blocks found puncturing Full Page Cache.".green().bold());
+    } else {
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL)
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_header(vec![
+                Cell::new("Module").fg(Color::Cyan),
+                Cell::new("Layout Handle").fg(Color::Cyan),
+                Cell::new("Block Name").fg(Color::Cyan),
+                Cell::new("Declaration Location").fg(Color::Cyan),
+            ]);
+
+        for b in uncacheable {
+            table.add_row(vec![
+                Cell::new(&b.module),
+                Cell::new(&b.layout_handle),
+                Cell::new(&b.block_name),
+                Cell::new(format!("{}:{}", b.source_file.display(), b.line)),
+            ]);
+        }
+        println!("{}\n", table);
+        println!("{}", "WARNING: cacheable=\"false\" disables FPC for the entire page, forcing 100% dynamic rendering.".yellow().bold());
+    }
+
+    ExitCode::from(0)
+}
+
+async fn handle_fpm(root_opt: Option<&Path>) -> ExitCode {
+    let installation = match build_installation_model(root_opt, false, false, 30).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{}: {}", "Error".red().bold(), e);
+            return ExitCode::from(3);
+        }
+    };
+
+    println!("\n{} - PHP-FPM Worker Pool Forensics\n", CALVER_VERSION.cyan().bold());
+    let fpm = &installation.runtime.php_workers;
+
+    if !fpm.is_detected {
+        println!("No active PHP-FPM pools detected in standard Linux socket/process paths.");
+        return ExitCode::from(0);
+    }
+
+    println!("Pool: {}", fpm.pool_name.cyan().bold());
+    println!("Process Manager: {}", fpm.process_manager);
+    println!("Active Workers:  {}/{} ({:.1}% saturation)", fpm.active_workers, fpm.max_children, fpm.saturation_pct);
+    println!("Idle Workers:    {}", fpm.idle_workers);
+    println!("Listen Queue:    {}", fpm.listen_queue);
+    println!("Max Children Hit Count: {}", fpm.max_children_reached);
+    println!("Estimated Worker Footprint: {:.0} MB", fpm.estimated_worker_memory_mb);
+    println!("Potential Pool Memory:      {:.0} MB", fpm.total_pool_memory_mb);
+
+    if fpm.oom_risk {
+        println!("\n{}", "CRITICAL: Pool memory exceeds host RAM capacity. Linux OOM-killer risk under traffic spikes!".red().bold());
+    } else if fpm.saturation_pct > 85.0 {
+        println!("\n{}", "WARNING: Worker saturation > 85%. Requests risk queuing or timing out with HTTP 504.".yellow().bold());
+    } else {
+        println!("\n{}", "✓ Worker pool operating within safe memory and concurrency bounds.".green().bold());
+    }
+
+    ExitCode::from(0)
+}
+
+async fn handle_opensearch(root_opt: Option<&Path>) -> ExitCode {
+    let installation = match build_installation_model(root_opt, false, false, 30).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{}: {}", "Error".red().bold(), e);
+            return ExitCode::from(3);
+        }
+    };
+
+    println!("\n{} - OpenSearch & Catalog Index Diagnostics\n", CALVER_VERSION.cyan().bold());
+    let os = &installation.runtime.opensearch;
+
+    if !os.is_configured && !os.is_reachable {
+        println!("OpenSearch endpoint not configured or unreachable.");
+        return ExitCode::from(0);
+    }
+
+    let status_cell = match os.status.as_deref() {
+        Some("green") => "GREEN".green().bold(),
+        Some("yellow") => "YELLOW".yellow().bold(),
+        Some("red") => "RED (CRITICAL)".red().bold(),
+        _ => "UNKNOWN".dimmed(),
+    };
+
+    println!("Cluster Name:      {}", os.cluster_name.as_deref().unwrap_or("unknown"));
+    println!("Cluster Status:    {}", status_cell);
+    println!("Nodes:             {}", os.number_of_nodes.unwrap_or(0));
+    println!("Active Shards:     {}", os.active_shards.unwrap_or(0));
+    println!("Unassigned Shards: {}", os.unassigned_shards.unwrap_or(0));
+    println!("Catalog Index:     {}", if os.has_catalog_index { "PRESENT (OK)".green().bold() } else { "MISSING (catalogsearch_fulltext required)".red().bold() });
 
     ExitCode::from(0)
 }

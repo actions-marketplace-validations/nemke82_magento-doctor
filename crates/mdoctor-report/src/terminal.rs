@@ -36,7 +36,32 @@ pub fn render_terminal_report(
     let third_party_count = installation.third_party_modules_count();
 
     out.push_str(&format!("Modules: {} enabled / {} disabled\n", enabled_count, disabled_count));
-    out.push_str(&format!("Third-party modules: {}\n\n", third_party_count));
+    out.push_str(&format!("Third-party modules: {}\n", third_party_count));
+
+    // Runtime Forensics Telemetry overview
+    let mut runtime_notes = Vec::new();
+    if !installation.runtime.fpc.uncacheable_blocks.is_empty() {
+        runtime_notes.push(format!("FPC: {} uncacheable layout block(s)", installation.runtime.fpc.uncacheable_blocks.len()));
+    }
+    if installation.runtime.php_workers.is_detected {
+        runtime_notes.push(format!(
+            "PHP-FPM: {}/{} workers ({:.0}%)",
+            installation.runtime.php_workers.active_workers,
+            installation.runtime.php_workers.max_children,
+            installation.runtime.php_workers.saturation_pct
+        ));
+    }
+    if !installation.database_metrics.query_digests.is_empty() {
+        runtime_notes.push(format!("SQL Digests: {} tracked", installation.database_metrics.query_digests.len()));
+    }
+    if let Some(ratio) = installation.runtime.redis_default.hit_ratio {
+        runtime_notes.push(format!("Redis Hit Ratio: {:.1}%", ratio * 100.0));
+    }
+    if !runtime_notes.is_empty() {
+        out.push_str(&format!("Runtime: {}\n\n", runtime_notes.join(" | ")));
+    } else {
+        out.push('\n');
+    }
 
     // 3. Health Score Badge
     let health_color = if health.overall >= 80 {

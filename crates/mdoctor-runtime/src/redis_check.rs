@@ -82,12 +82,14 @@ mod tests {
 
     #[test]
     fn test_redis_collision_detection_same_host() {
-        let mut config = SanitizedEnvConfig::default();
-        config.redis_session_host = Some("127.0.0.1:6379".to_string());
-        config.redis_cache_host = Some("localhost:6379".to_string());
-        config.redis_session_db = Some("0".to_string());
-        config.redis_cache_db = Some("0".to_string());
-        config.redis_page_cache_db = Some("1".to_string());
+        let config = SanitizedEnvConfig {
+            redis_session_host: Some("127.0.0.1:6379".to_string()),
+            redis_cache_host: Some("localhost:6379".to_string()),
+            redis_session_db: Some("0".to_string()),
+            redis_cache_db: Some("0".to_string()),
+            redis_page_cache_db: Some("1".to_string()),
+            ..Default::default()
+        };
 
         let issues = check_redis_config(&config);
         assert_eq!(issues.len(), 1);
@@ -99,13 +101,15 @@ mod tests {
 
     #[test]
     fn test_redis_no_collision_when_different_hosts() {
-        let mut config = SanitizedEnvConfig::default();
-        config.redis_session_host = Some("redis-session:6379".to_string());
-        config.redis_cache_host = Some("redis-cache:6379".to_string());
-        config.redis_page_cache_host = Some("redis-fpc:6379".to_string());
-        config.redis_session_db = Some("0".to_string());
-        config.redis_cache_db = Some("0".to_string());
-        config.redis_page_cache_db = Some("0".to_string());
+        let config = SanitizedEnvConfig {
+            redis_session_host: Some("redis-session:6379".to_string()),
+            redis_cache_host: Some("redis-cache:6379".to_string()),
+            redis_page_cache_host: Some("redis-fpc:6379".to_string()),
+            redis_session_db: Some("0".to_string()),
+            redis_cache_db: Some("0".to_string()),
+            redis_page_cache_db: Some("0".to_string()),
+            ..Default::default()
+        };
 
         let issues = check_redis_config(&config);
         assert!(issues.is_empty(), "Different hostnames must not be reported as collision");
@@ -113,11 +117,13 @@ mod tests {
 
     #[test]
     fn test_redis_no_collision_when_different_ports() {
-        let mut config = SanitizedEnvConfig::default();
-        config.redis_session_host = Some("127.0.0.1:6379".to_string());
-        config.redis_cache_host = Some("127.0.0.1:6380".to_string());
-        config.redis_session_db = Some("0".to_string());
-        config.redis_cache_db = Some("0".to_string());
+        let config = SanitizedEnvConfig {
+            redis_session_host: Some("127.0.0.1:6379".to_string()),
+            redis_cache_host: Some("127.0.0.1:6380".to_string()),
+            redis_session_db: Some("0".to_string()),
+            redis_cache_db: Some("0".to_string()),
+            ..Default::default()
+        };
 
         let issues = check_redis_config(&config);
         assert!(issues.is_empty(), "Different ports on same host must not be reported as collision");

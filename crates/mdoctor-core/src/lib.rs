@@ -4,6 +4,7 @@ pub mod drift;
 pub mod finding;
 pub mod health;
 pub mod impact;
+pub mod investigate;
 pub mod model;
 pub mod safety;
 pub mod snapshot;
@@ -17,6 +18,7 @@ pub use drift::{
 pub use finding::{Category, Confidence, Finding, Severity};
 pub use health::HealthScore;
 pub use impact::{ImpactLevel, ModuleImpactScore, RiskDriver};
+pub use investigate::{CausalChain, CausalNode, CausalNodeType, InvestigationResult};
 pub use model::*;
 pub use safety::{SafetyLevel, ScanBudget};
 pub use snapshot::DiagnosticSnapshot;

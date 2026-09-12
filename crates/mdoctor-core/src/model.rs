@@ -307,6 +307,33 @@ pub struct CronScheduleSummary {
     pub job_stats: HashMap<String, JobRuntimeStat>,
 }
 
+/// Query digest metric extracted from performance_schema or slow log.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueryDigest {
+    pub digest_id: String,
+    pub fingerprint: String,
+    pub execution_count: u64,
+    pub total_time_ms: f64,
+    pub avg_time_ms: f64,
+    pub max_time_ms: f64,
+    pub avg_rows_examined: u64,
+    pub avg_rows_sent: u64,
+    pub tables_involved: Vec<String>,
+    pub first_seen: Option<String>,
+    pub last_seen: Option<String>,
+}
+
+/// Active lock contention or blocked transaction.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActiveLockWait {
+    pub waiting_query_id: u64,
+    pub waiting_query: String,
+    pub blocking_query_id: Option<u64>,
+    pub blocking_query: Option<String>,
+    pub wait_time_secs: u64,
+    pub table_name: Option<String>,
+}
+
 /// Runtime database metrics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DatabaseMetrics {
@@ -317,6 +344,9 @@ pub struct DatabaseMetrics {
     pub table_sizes: Vec<TableSizeStat>,
     pub cron_schedule: CronScheduleSummary,
     pub changelog_sizes: HashMap<String, u64>,
+    pub query_digests: Vec<QueryDigest>,
+    pub active_lock_waits: Vec<ActiveLockWait>,
+    pub active_connections: Option<u64>,
 }
 
 /// Environment and host metadata.
@@ -360,10 +390,17 @@ pub struct RedisStatus {
     pub is_reachable: bool,
     pub version: Option<String>,
     pub used_memory_bytes: Option<u64>,
+    pub used_memory_peak_bytes: Option<u64>,
     pub maxmemory_bytes: Option<u64>,
     pub maxmemory_policy: Option<String>,
+    pub mem_fragmentation_ratio: Option<f64>,
     pub evicted_keys: Option<u64>,
     pub connected_clients: Option<u64>,
+    pub blocked_clients: Option<u64>,
+    pub keyspace_hits: Option<u64>,
+    pub keyspace_misses: Option<u64>,
+    pub hit_ratio: Option<f64>,
+    pub ops_per_sec: Option<u64>,
 }
 
 /// OpenSearch runtime status.
@@ -376,6 +413,10 @@ pub struct OpenSearchStatus {
     pub status: Option<String>, // green, yellow, red
     pub number_of_nodes: Option<u32>,
     pub active_primary_shards: Option<u32>,
+    pub active_shards: Option<u32>,
+    pub unassigned_shards: Option<u32>,
+    pub has_catalog_index: bool,
+    pub catalog_docs_count: Option<u64>,
 }
 
 /// OPcache status.
@@ -387,6 +428,70 @@ pub struct OpcacheStatus {
     pub validate_timestamps: Option<bool>,
 }
 
+/// PHP-FPM pool status and worker pressure metrics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PhpWorkerMetrics {
+    pub is_detected: bool,
+    pub pool_name: String,
+    pub process_manager: String,
+    pub active_workers: usize,
+    pub idle_workers: usize,
+    pub total_workers: usize,
+    pub max_children: usize,
+    pub listen_queue: usize,
+    pub max_children_reached: u64,
+    pub saturation_pct: f64,
+    pub estimated_worker_memory_mb: f64,
+    pub total_pool_memory_mb: f64,
+    pub oom_risk: bool,
+}
+
+/// Full Page Cache engine type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FpcEngine {
+    BuiltIn,
+    Varnish,
+    LiteMage,
+    #[default]
+    Unknown,
+    Disabled,
+}
+
+impl std::fmt::Display for FpcEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FpcEngine::BuiltIn => write!(f, "Built-in (File/Redis)"),
+            FpcEngine::Varnish => write!(f, "Varnish Reverse Proxy"),
+            FpcEngine::LiteMage => write!(f, "LiteMage"),
+            FpcEngine::Disabled => write!(f, "Disabled"),
+            FpcEngine::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+/// Storefront layout block with cacheable="false" puncturing FPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UncacheableBlock {
+    pub module: String,
+    pub layout_handle: String,
+    pub block_name: String,
+    pub class_name: Option<String>,
+    pub template: Option<String>,
+    pub source_file: PathBuf,
+    pub line: usize,
+}
+
+/// FPC and Reverse Proxy status.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FpcProbeStatus {
+    pub engine: FpcEngine,
+    pub is_varnish_configured: bool,
+    pub is_varnish_reachable: bool,
+    pub varnish_host: Option<String>,
+    pub varnish_port: Option<u16>,
+    pub uncacheable_blocks: Vec<UncacheableBlock>,
+}
+
 /// Host & Runtime state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeState {
@@ -395,6 +500,8 @@ pub struct RuntimeState {
     pub redis_session: RedisStatus,
     pub opensearch: OpenSearchStatus,
     pub opcache: OpcacheStatus,
+    pub php_workers: PhpWorkerMetrics,
+    pub fpc: FpcProbeStatus,
     pub web_server: Option<String>,
 }
 

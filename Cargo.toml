@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2026.9.6"
+version = "2026.9.12"
 edition = "2021"
 authors = ["nemke82 <nemke82@users.noreply.github.com>", "Magento Doctor Contributors"]
 license = "MIT"

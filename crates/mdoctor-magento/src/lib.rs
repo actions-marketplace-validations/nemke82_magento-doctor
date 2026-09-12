@@ -11,3 +11,4 @@ pub use collector::collect_installation;
 pub use discovery::{discover_magento_root, is_valid_magento_root};
 pub use env_parser::parse_env_php;
 pub use module_parser::{classify_module, discover_modules, parse_config_php};
+pub use xml::layout::{parse_layout_xml, parse_layout_xml_str};

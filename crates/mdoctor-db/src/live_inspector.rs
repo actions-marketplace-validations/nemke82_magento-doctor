@@ -148,6 +148,115 @@ pub async fn inspect_live_database(
 
     metrics.cron_schedule = cron_summary;
 
+    // 5. Active connection count
+    if let Ok(Ok(threads_rows)) = tokio::time::timeout(
+        query_timeout,
+        conn.query_map(
+            "SHOW STATUS LIKE 'Threads_connected'",
+            |(_name, val): (String, String)| val.parse::<u64>().unwrap_or(0),
+        ),
+    )
+    .await
+    {
+        if let Some(t) = threads_rows.into_iter().next() {
+            metrics.active_connections = Some(t);
+        }
+    }
+
+    // 6. Query digests from performance_schema
+    let digest_query = r#"
+        SELECT
+            IFNULL(DIGEST, ''),
+            IFNULL(DIGEST_TEXT, ''),
+            IFNULL(COUNT_STAR, 0),
+            IFNULL(SUM_TIMER_WAIT, 0),
+            IFNULL(AVG_TIMER_WAIT, 0),
+            IFNULL(MAX_TIMER_WAIT, 0),
+            IFNULL(SUM_ROWS_EXAMINED, 0),
+            IFNULL(SUM_ROWS_SENT, 0),
+            IFNULL(DATE_FORMAT(FIRST_SEEN, '%Y-%m-%d %H:%i:%s'), ''),
+            IFNULL(DATE_FORMAT(LAST_SEEN, '%Y-%m-%d %H:%i:%s'), '')
+        FROM performance_schema.events_statements_summary_by_digest
+        WHERE DIGEST_TEXT IS NOT NULL
+          AND DIGEST_TEXT NOT LIKE '%performance_schema%'
+          AND DIGEST_TEXT NOT LIKE 'SHOW %'
+          AND DIGEST_TEXT NOT LIKE 'SELECT VERSION%'
+        ORDER BY SUM_TIMER_WAIT DESC
+        LIMIT 15
+    "#;
+
+    if let Ok(Ok(digest_rows)) = tokio::time::timeout(
+        query_timeout,
+        conn.query_map(
+            digest_query,
+            |(digest_id, text, count, sum_time, avg_time, max_time, rows_exam, rows_sent, first, last): (
+                String,
+                String,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                String,
+                String,
+            )| {
+                let total_ms = sum_time as f64 / 1_000_000_000.0;
+                let avg_ms = avg_time as f64 / 1_000_000_000.0;
+                let max_ms = max_time as f64 / 1_000_000_000.0;
+                let tables = crate::correlation::extract_tables_from_sql(&text);
+                mdoctor_core::QueryDigest {
+                    digest_id,
+                    fingerprint: text,
+                    execution_count: count,
+                    total_time_ms: total_ms,
+                    avg_time_ms: avg_ms,
+                    max_time_ms: max_ms,
+                    avg_rows_examined: rows_exam.checked_div(count).unwrap_or(0),
+                    avg_rows_sent: rows_sent.checked_div(count).unwrap_or(0),
+                    tables_involved: tables,
+                    first_seen: if first.is_empty() { None } else { Some(first) },
+                    last_seen: if last.is_empty() { None } else { Some(last) },
+                }
+            },
+        ),
+    )
+    .await
+    {
+        metrics.query_digests = digest_rows;
+    }
+
+    // 7. Active lock contention / slow processlist queries
+    let locks_query = r#"
+        SELECT
+            ID,
+            IFNULL(INFO, ''),
+            TIME
+        FROM information_schema.processlist
+        WHERE COMMAND != 'Sleep' AND (TIME > 3 OR STATE LIKE '%lock%')
+        ORDER BY TIME DESC
+        LIMIT 10
+    "#;
+
+    if let Ok(Ok(lock_rows)) = tokio::time::timeout(
+        query_timeout,
+        conn.query_map(locks_query, |(id, info, time_sec): (u64, String, u64)| {
+            let tables = crate::correlation::extract_tables_from_sql(&info);
+            mdoctor_core::ActiveLockWait {
+                waiting_query_id: id,
+                waiting_query: info,
+                blocking_query_id: None,
+                blocking_query: None,
+                wait_time_secs: time_sec,
+                table_name: tables.into_iter().next(),
+            }
+        }),
+    )
+    .await
+    {
+        metrics.active_lock_waits = lock_rows;
+    }
+
     // CRITICAL: Drop active connection back into pool before disconnecting!
     // mysql_async::Pool::disconnect() waits indefinitely for active checked-out
     // connections to be dropped, causing a deadlock if conn is still in scope.
