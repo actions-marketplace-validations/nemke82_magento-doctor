@@ -135,7 +135,7 @@ chmod +x /usr/local/bin/mdoctor
 Verify installation:
 ```bash
 mdoctor --version
-# Output: mdoctor v2026.09.06
+# Output: mdoctor v2026.09.12
 ```
 
 ### Option 2: Cargo Install
@@ -186,10 +186,12 @@ MAGENTO_ROOT=/var/www/magento mdoctor scan
 | `mdoctor redis` | Redis & Valkey deep internals: memory, fragmentation, eviction policy & hit ratios |
 | `mdoctor fpm` | PHP-FPM worker saturation gauge, process manager, listen queue & OOM risk |
 | `mdoctor opensearch` | OpenSearch cluster health, shard allocation, and catalog search index status |
+| `mdoctor nginx` | Nginx web-tier active connections, request rate, and dropped connections via `stub_status` |
 | `mdoctor baseline create` | Export current store state as a baseline for drift comparison |
 | `mdoctor compare <baseline>` | Compare store against baseline to detect configuration drift and regressions |
 | `mdoctor modules` | Module inventory, classification, and integration footprint metrics |
 | `mdoctor modules --impact` | Rank installed extensions by architectural risk and performance impact |
+| `mdoctor impact` | Fast alias to rank installed extensions by architectural risk and performance impact |
 | `mdoctor module <Vendor_Module>` | Deep inspection of a specific module's plugins, observers, crons, and schema |
 | `mdoctor module <Name> --uninstall-impact` | Forensic blast-radius check for sequence breaks and orphaned DB tables |
 | `mdoctor module <Name> --graph mermaid` | Export visual architecture diagram in Mermaid.js flowchart syntax |
@@ -280,6 +282,9 @@ mdoctor fpm
 
 # OpenSearch cluster health, shard unallocations, and catalog index presence
 mdoctor opensearch
+
+# Nginx web-tier active connections, request rate, and dropped connections
+mdoctor nginx
 ```
 
 ### Clustered Stores & Jump-Host Runs
