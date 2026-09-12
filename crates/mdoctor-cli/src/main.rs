@@ -1295,8 +1295,18 @@ async fn handle_opensearch(root_opt: Option<&Path>, targets: &RemoteTargets) -> 
     println!("\n{} - OpenSearch & Catalog Index Diagnostics\n", CALVER_VERSION.cyan().bold());
     let os = &installation.runtime.opensearch;
 
-    if !os.is_configured && !os.is_reachable {
-        println!("OpenSearch endpoint not configured or unreachable.");
+    if !os.is_reachable {
+        // Reporting zeros here would read as an empty cluster; say what went wrong.
+        if !os.is_configured {
+            println!("No OpenSearch endpoint configured in env.php.");
+        } else {
+            println!("Endpoint: {}", os.probe.to_string().yellow());
+        }
+        println!(
+            "\n{}",
+            "If OpenSearch runs on another node, pass --opensearch host:9200 (and --opensearch-auth, or MDOCTOR_OPENSEARCH_AUTH, for a secured cluster)."
+                .dimmed()
+        );
         return ExitCode::from(0);
     }
 
@@ -1312,7 +1322,20 @@ async fn handle_opensearch(root_opt: Option<&Path>, targets: &RemoteTargets) -> 
     println!("Nodes:             {}", os.number_of_nodes.unwrap_or(0));
     println!("Active Shards:     {}", os.active_shards.unwrap_or(0));
     println!("Unassigned Shards: {}", os.unassigned_shards.unwrap_or(0));
-    println!("Catalog Index:     {}", if os.has_catalog_index { "PRESENT (OK)".green().bold() } else { "MISSING (catalogsearch_fulltext required)".red().bold() });
+    println!(
+        "Catalog Index:     {}",
+        if os.has_catalog_index {
+            format!("PRESENT ({})", os.catalog_index_names.join(", ")).green().bold()
+        } else if os.catalog_index_probe.is_success() {
+            "MISSING (run indexer:reindex catalogsearch_fulltext)".red().bold()
+        } else {
+            // A listing we could not read tells us nothing about index presence.
+            format!("UNKNOWN (index listing {})", os.catalog_index_probe).yellow()
+        }
+    );
+    if let Some(version) = &os.version {
+        println!("Version:           {}", version);
+    }
 
     ExitCode::from(0)
 }
