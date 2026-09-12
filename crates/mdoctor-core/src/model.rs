@@ -652,6 +652,7 @@ pub struct NginxStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeState {
     pub redis_default: RedisStatus,
+    /// Page-cache (FPC) Redis instance, when it is separate from the default cache.
     pub redis_page_cache: RedisStatus,
     pub redis_session: RedisStatus,
     pub opensearch: OpenSearchStatus,

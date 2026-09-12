@@ -531,6 +531,14 @@ async fn build_installation_model(
             installation.runtime.redis_session =
                 inspect_redis(&endpoint, redis_password, probe_timeout).await;
         }
+        if let Some(endpoint) = targets
+            .redis_page_cache
+            .clone()
+            .or_else(|| endpoint_from_env(installation.env_config.redis_page_cache_host.as_deref()))
+        {
+            installation.runtime.redis_page_cache =
+                inspect_redis(&endpoint, redis_password, probe_timeout).await;
+        }
 
         // 5. OpenSearch
         if let Some(endpoint) = targets.opensearch.clone().or_else(|| {
@@ -1008,6 +1016,7 @@ async fn handle_redis(root_opt: Option<&Path>, targets: &RemoteTargets) -> ExitC
     let instances = [
         ("Default / Cache", &installation.runtime.redis_default),
         ("Session", &installation.runtime.redis_session),
+        ("Page Cache (FPC)", &installation.runtime.redis_page_cache),
     ];
 
     for (name, st) in &instances {
@@ -1058,13 +1067,13 @@ async fn handle_redis(root_opt: Option<&Path>, targets: &RemoteTargets) -> ExitC
     // Say why a probe failed: "unreachable" alone leaves the operator guessing between
     // a wrong address, a firewall, and a missing password.
     for (name, st) in &instances {
-        if !st.is_reachable {
+        if !st.is_reachable && st.is_configured {
             if let mdoctor_core::ProbeOutcome::Failed { reason } = &st.probe {
                 println!("{} ({}): {}", name, "probe failed".yellow(), reason);
             }
         }
     }
-    if instances.iter().any(|(_, st)| !st.is_reachable) {
+    if instances.iter().any(|(_, st)| !st.is_reachable && st.is_configured) {
         println!(
             "\n{}",
             "If Redis runs on another node, pass --redis-cache / --redis-session (and --redis-password, or MDOCTOR_REDIS_PASSWORD)."
