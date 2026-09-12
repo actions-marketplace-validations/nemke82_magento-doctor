@@ -9,6 +9,7 @@ use crate::rules::cron_rules::evaluate_cron_rules;
 use crate::rules::db_rules::evaluate_db_rules;
 use crate::rules::di_rules::evaluate_di_rules;
 use crate::rules::env_rules::evaluate_env_rules;
+use crate::rules::forensics_rules::evaluate_forensics_rules;
 use crate::rules::perf_rules::evaluate_perf_rules;
 use crate::rules::plugin_rules::evaluate_plugin_rules;
 
@@ -30,6 +31,7 @@ impl CrossAnalysisEngine {
         findings.extend(evaluate_db_rules(installation));
         findings.extend(evaluate_cache_rules(installation));
         findings.extend(evaluate_env_rules(installation));
+        findings.extend(evaluate_forensics_rules(installation));
 
         // 3. Sort findings: Critical first, then Warning, then Info
         findings.sort_by(|a, b| {

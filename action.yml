@@ -67,6 +67,10 @@ runs:
           MDOCTOR_BIN="cargo run --release -p mdoctor-cli --"
         fi
 
+        # mdoctor signals findings through its exit code (1 = warnings, 2 = critical,
+        # 3 = execution error). Composite action steps run under `bash -e`, which would
+        # abort here before the fail-on threshold below is ever evaluated.
+        set +e
         if [ -n "$INPUT_OUTPUT" ]; then
           $MDOCTOR_BIN "${CMD_ARGS[@]}" > "$INPUT_OUTPUT"
           EXIT_CODE=$?
@@ -74,6 +78,7 @@ runs:
           $MDOCTOR_BIN "${CMD_ARGS[@]}"
           EXIT_CODE=$?
         fi
+        set -e
 
         if [ "$INPUT_FAIL_ON" = "critical" ] && [ "$EXIT_CODE" -eq 2 ]; then
           echo "::error::Magento Doctor identified critical issues or regressions!"
