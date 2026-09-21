@@ -9,6 +9,28 @@ pub enum RedisIssue {
     SameDatabaseForCacheAndPageCache { cache_db: String, fpc_db: String },
 }
 
+impl std::fmt::Display for RedisIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SameDatabaseForSessionAndCache { session_db, cache_db } => write!(
+                f,
+                "Sessions (db {}) and the default cache (db {}) share one Redis database: a cache flush destroys active sessions",
+                session_db, cache_db
+            ),
+            Self::SameDatabaseForSessionAndPageCache { session_db, fpc_db } => write!(
+                f,
+                "Sessions (db {}) and the page cache (db {}) share one Redis database: an FPC flush destroys active sessions",
+                session_db, fpc_db
+            ),
+            Self::SameDatabaseForCacheAndPageCache { cache_db, fpc_db } => write!(
+                f,
+                "The default cache (db {}) and page cache (db {}) share one Redis database: flushing either clears both",
+                cache_db, fpc_db
+            ),
+        }
+    }
+}
+
 /// Determine if two Redis endpoints point to the same Redis instance.
 /// Returns false if both hosts/instances are specified and are clearly distinct.
 fn is_same_redis_instance(host_a: Option<&str>, host_b: Option<&str>) -> bool {
@@ -82,12 +104,14 @@ mod tests {
 
     #[test]
     fn test_redis_collision_detection_same_host() {
-        let mut config = SanitizedEnvConfig::default();
-        config.redis_session_host = Some("127.0.0.1:6379".to_string());
-        config.redis_cache_host = Some("localhost:6379".to_string());
-        config.redis_session_db = Some("0".to_string());
-        config.redis_cache_db = Some("0".to_string());
-        config.redis_page_cache_db = Some("1".to_string());
+        let config = SanitizedEnvConfig {
+            redis_session_host: Some("127.0.0.1:6379".to_string()),
+            redis_cache_host: Some("localhost:6379".to_string()),
+            redis_session_db: Some("0".to_string()),
+            redis_cache_db: Some("0".to_string()),
+            redis_page_cache_db: Some("1".to_string()),
+            ..Default::default()
+        };
 
         let issues = check_redis_config(&config);
         assert_eq!(issues.len(), 1);
@@ -99,13 +123,15 @@ mod tests {
 
     #[test]
     fn test_redis_no_collision_when_different_hosts() {
-        let mut config = SanitizedEnvConfig::default();
-        config.redis_session_host = Some("redis-session:6379".to_string());
-        config.redis_cache_host = Some("redis-cache:6379".to_string());
-        config.redis_page_cache_host = Some("redis-fpc:6379".to_string());
-        config.redis_session_db = Some("0".to_string());
-        config.redis_cache_db = Some("0".to_string());
-        config.redis_page_cache_db = Some("0".to_string());
+        let config = SanitizedEnvConfig {
+            redis_session_host: Some("redis-session:6379".to_string()),
+            redis_cache_host: Some("redis-cache:6379".to_string()),
+            redis_page_cache_host: Some("redis-fpc:6379".to_string()),
+            redis_session_db: Some("0".to_string()),
+            redis_cache_db: Some("0".to_string()),
+            redis_page_cache_db: Some("0".to_string()),
+            ..Default::default()
+        };
 
         let issues = check_redis_config(&config);
         assert!(issues.is_empty(), "Different hostnames must not be reported as collision");
@@ -113,11 +139,13 @@ mod tests {
 
     #[test]
     fn test_redis_no_collision_when_different_ports() {
-        let mut config = SanitizedEnvConfig::default();
-        config.redis_session_host = Some("127.0.0.1:6379".to_string());
-        config.redis_cache_host = Some("127.0.0.1:6380".to_string());
-        config.redis_session_db = Some("0".to_string());
-        config.redis_cache_db = Some("0".to_string());
+        let config = SanitizedEnvConfig {
+            redis_session_host: Some("127.0.0.1:6379".to_string()),
+            redis_cache_host: Some("127.0.0.1:6380".to_string()),
+            redis_session_db: Some("0".to_string()),
+            redis_cache_db: Some("0".to_string()),
+            ..Default::default()
+        };
 
         let issues = check_redis_config(&config);
         assert!(issues.is_empty(), "Different ports on same host must not be reported as collision");

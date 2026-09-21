@@ -10,6 +10,8 @@ pub struct ParsedEnv {
     pub mode: MagentoMode,
     pub config: SanitizedEnvConfig,
     pub raw_db_password: Option<String>, // Only used for live connection in mdoctor_db, never serialized or exposed!
+    /// Redis `requirepass` from env.php, for live probes only. Never serialized.
+    pub raw_redis_password: Option<String>,
 }
 
 /// Parse app/etc/env.php safely.
@@ -92,6 +94,25 @@ pub fn parse_env_php(env_file_path: &Path) -> ParsedEnv {
         }
     }
 
+    /// Returns the contents of the first bracketed array in `slice`, brackets matched.
+    fn matching_bracket_slice(slice: &str) -> Option<&str> {
+        let open = slice.find('[')?;
+        let mut depth = 0usize;
+        for (offset, ch) in slice[open..].char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&slice[open + 1..open + offset]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     // 4. Redis session database & host
     if let Some(session_pos) = content.find("'session'").or_else(|| content.find("\"session\"")) {
         let session_slice = &content[session_pos..];
@@ -134,6 +155,44 @@ pub fn parse_env_php(env_file_path: &Path) -> ParsedEnv {
             if let Some(caps) = redis_fpc_db_re.captures(cache_slice) {
                 parsed.config.redis_page_cache_db = Some(caps[1].to_string());
             }
+        }
+    }
+
+    // 6. http_cache_hosts: the only reliable signal that Magento is configured to
+    // front the store with Varnish (or another purgeable proxy tier).
+    if let Some(hosts_pos) = content
+        .find("'http_cache_hosts'")
+        .or_else(|| content.find("\"http_cache_hosts\""))
+    {
+        let slice = &content[hosts_pos..];
+        // Each host is its own nested array, so the first "]," closes only the first
+        // entry: walk brackets to find where the http_cache_hosts array really ends.
+        let block = match matching_bracket_slice(slice) {
+            Some(inner) => inner,
+            None => slice,
+        };
+
+        let host_re = Regex::new(r#"['"]host['"]\s*=>\s*['"]([^'"]+)['"]"#).unwrap();
+        let port_re = Regex::new(r#"['"]port['"]\s*=>\s*['"]?([0-9]+)['"]?"#).unwrap();
+        let ports: Vec<&str> = port_re.captures_iter(block).map(|c| c.get(1).unwrap().as_str()).collect();
+
+        for (idx, caps) in host_re.captures_iter(block).enumerate() {
+            let host = caps[1].to_string();
+            parsed.config.http_cache_hosts.push(match ports.get(idx) {
+                Some(port) if !host.contains(':') => format!("{}:{}", host, port),
+                _ => host,
+            });
+        }
+    }
+
+    // 7. Redis password, shared across cache and session backends in practice.
+    let redis_pass_re = Regex::new(r#"['"]password['"]\s*=>\s*['"]([^'"]+)['"]"#).unwrap();
+    for caps in redis_pass_re.captures_iter(&content) {
+        let candidate = caps[1].to_string();
+        // The db password is captured separately; anything else is a backend secret.
+        if parsed.raw_db_password.as_deref() != Some(candidate.as_str()) {
+            parsed.raw_redis_password = Some(candidate);
+            break;
         }
     }
 
@@ -189,6 +248,62 @@ return [
         assert_eq!(parsed.config.redis_session_db.as_deref(), Some("2"));
         assert_eq!(parsed.config.redis_cache_db.as_deref(), Some("0"));
         assert_eq!(parsed.config.redis_page_cache_db.as_deref(), Some("1"));
+
+        let _ = std::fs::remove_file(temp);
+    }
+
+    #[test]
+    fn test_parse_http_cache_hosts() {
+        let sample = r#"<?php
+return [
+    'http_cache_hosts' => [
+        ['host' => 'varnish-1.internal', 'port' => '6081'],
+        ['host' => 'varnish-2.internal', 'port' => '6081'],
+    ],
+    'MAGE_MODE' => 'production',
+];
+"#;
+        let temp = std::env::temp_dir().join("test_env_varnish.php");
+        std::fs::write(&temp, sample).unwrap();
+
+        let parsed = parse_env_php(&temp);
+        assert_eq!(
+            parsed.config.http_cache_hosts,
+            vec!["varnish-1.internal:6081".to_string(), "varnish-2.internal:6081".to_string()]
+        );
+
+        let _ = std::fs::remove_file(temp);
+    }
+
+    #[test]
+    fn test_no_http_cache_hosts_means_not_configured_for_varnish() {
+        let temp = std::env::temp_dir().join("test_env_no_varnish.php");
+        std::fs::write(&temp, "<?php\nreturn ['MAGE_MODE' => 'production'];\n").unwrap();
+
+        let parsed = parse_env_php(&temp);
+        assert!(parsed.config.http_cache_hosts.is_empty());
+
+        let _ = std::fs::remove_file(temp);
+    }
+
+    #[test]
+    fn test_parse_redis_password_distinct_from_db_password() {
+        let sample = r#"<?php
+return [
+    'db' => ['connection' => ['default' => [
+        'host' => 'db-1', 'dbname' => 'm2', 'username' => 'm2', 'password' => 'db_secret',
+    ]]],
+    'cache' => ['frontend' => ['default' => ['backend_options' => [
+        'server' => 'cache-1', 'port' => '6379', 'database' => '0', 'password' => 'redis_secret',
+    ]]]],
+];
+"#;
+        let temp = std::env::temp_dir().join("test_env_redis_pass.php");
+        std::fs::write(&temp, sample).unwrap();
+
+        let parsed = parse_env_php(&temp);
+        assert_eq!(parsed.raw_db_password.as_deref(), Some("db_secret"));
+        assert_eq!(parsed.raw_redis_password.as_deref(), Some("redis_secret"));
 
         let _ = std::fs::remove_file(temp);
     }

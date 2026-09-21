@@ -36,7 +36,40 @@ pub fn render_terminal_report(
     let third_party_count = installation.third_party_modules_count();
 
     out.push_str(&format!("Modules: {} enabled / {} disabled\n", enabled_count, disabled_count));
-    out.push_str(&format!("Third-party modules: {}\n\n", third_party_count));
+    out.push_str(&format!("Third-party modules: {}\n", third_party_count));
+
+    // Runtime Forensics Telemetry overview
+    let mut runtime_notes = Vec::new();
+    if !installation.runtime.fpc.uncacheable_blocks.is_empty() {
+        runtime_notes.push(format!("FPC: {} uncacheable layout block(s)", installation.runtime.fpc.uncacheable_blocks.len()));
+    }
+    let fpm = &installation.runtime.php_workers;
+    if fpm.is_detected {
+        // Only print figures that were actually measured, and say where they came from,
+        // so an approximate /proc reading is not mistaken for a scoreboard reading.
+        let workers = match (fpm.active_workers, fpm.max_children) {
+            (Some(active), Some(max)) => format!("{}/{} workers", active, max),
+            (Some(active), None) => format!("{} workers active", active),
+            (None, Some(max)) => format!("max_children {}", max),
+            (None, None) => "detected".to_string(),
+        };
+        let saturation = fpm
+            .saturation_pct
+            .map(|s| format!(" ({:.0}%)", s))
+            .unwrap_or_default();
+        runtime_notes.push(format!("PHP-FPM: {}{} via {}", workers, saturation, fpm.source));
+    }
+    if !installation.database_metrics.query_digests.is_empty() {
+        runtime_notes.push(format!("SQL Digests: {} tracked", installation.database_metrics.query_digests.len()));
+    }
+    if let Some(ratio) = installation.runtime.redis_default.hit_ratio {
+        runtime_notes.push(format!("Redis Hit Ratio: {:.1}%", ratio * 100.0));
+    }
+    if !runtime_notes.is_empty() {
+        out.push_str(&format!("Runtime: {}\n\n", runtime_notes.join(" | ")));
+    } else {
+        out.push('\n');
+    }
 
     // 3. Health Score Badge
     let health_color = if health.overall >= 80 {
